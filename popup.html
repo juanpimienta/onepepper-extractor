@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Extractor de correos y teléfonos</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <main>
+      <section id="shared-top"></section>
+      <div id="popup-tabs" class="popup-tabs">
+        <button
+          type="button"
+          class="popup-tab popup-tab--active"
+          data-tab-target="extractor"
+          title="Scraping: analiza la web abierta y guarda correos, teléfonos y enlaces clave."
+        >
+          Scraping
+        </button>
+        <button
+          type="button"
+          class="popup-tab popup-tab--premium"
+          data-tab-target="remote-scan-tab"
+          title="URL(s): pega hasta 20 URLs premium para escanearlas y agregarlas al Excel o CSV."
+        >
+          URL(s) <span class="popup-tab__badge">Premium</span>
+        </button>
+      </div>
+      <section id="extractor" class="tab-content active">
+        <div id="results"></div>
+        <div id="deep-progress" style="margin-top:10px; display:none;">
+          <div id="deep-progress-line" style="font-size:12px;"></div>
+          <div style="height:6px;background:#eee;border-radius:999px;overflow:hidden;">
+            <div id="deep-progress-meter" style="height:100%;width:0%;transition:width .2s;"></div>
+          </div>
+        </div>
+      </section>
+      <section id="remote-scan-tab" class="tab-content" hidden>
+        <div id="remote-scan-content"></div>
+      </section>
+      <!-- ✅ Bloque mínimo seguro para que SIEMPRE tenga ancho -->
+      <style id="popup-minsize">
+        :root{
+          --popup-min-w: 640px;   /* ajusta aquí el ancho mínimo que quieras */
+          --popup-min-h: 560px;   /* opcional, para evitar alto enano */
+        }
+        html, body {
+          min-width: var(--popup-min-w);
+          min-height: var(--popup-min-h);
+          box-sizing: border-box;
+          overflow-x: hidden;
+        }
+        #app, main {
+          min-width: var(--popup-min-w);
+          box-sizing: border-box;
+        }
+        #results,
+        #remote-scan-content{
+          width:100%;
+          min-width:0;
+          box-sizing:border-box;
+        }
+        main{
+          padding-bottom:110px !important;
+        }
+        .popup-tabs{
+          display:flex;
+          align-items:stretch;
+          justify-content:center;
+          gap:8px;
+          padding:8px 10px 0;
+          margin-bottom:14px;
+        }
+        .popup-tab{
+          flex:0 0 156px;
+          border:1px solid #dbe4ea;
+          background:#fff;
+          color:#334155;
+          border-radius:999px;
+          min-height:44px;
+          padding:0 18px;
+          font-size:12px;
+          font-weight:700;
+          cursor:pointer;
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          gap:6px;
+          line-height:1;
+        }
+        .popup-tab--active{
+          background:#27cdf2;
+          border-color:#27cdf2;
+          color:#fff;
+        }
+        .popup-tab--premium{
+          border-color:#98e8f6;
+          box-shadow:0 0 0 2px rgba(39,205,242,.12);
+        }
+        .popup-tab__badge{
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          border-radius:999px;
+          min-height:26px;
+          padding:0 10px;
+          font-size:10px;
+          font-weight:800;
+          background:#e6faff;
+          color:#075985;
+          border:1px solid #98e8f6;
+          line-height:1;
+        }
+        .popup-tab--active .popup-tab__badge{
+          background:rgba(255,255,255,.16);
+          color:#fff;
+          border-color:rgba(255,255,255,.35);
+        }
+        .tab-content{
+          width:100%;
+          max-width:620px;
+          margin:0 auto;
+          padding:0 12px;
+          box-sizing:border-box;
+        }
+        .scroll-jump{
+          position:fixed;
+          left:50%;
+          bottom:54px;
+          transform:translateX(-50%);
+          width:34px;
+          height:34px;
+          border:none;
+          border-radius:999px;
+          background:#fff;
+          color:#0f172a;
+          border:1px solid rgba(39,205,242,.26);
+          font-size:16px;
+          font-weight:900;
+          line-height:1;
+          cursor:pointer;
+          box-shadow:
+            0 10px 24px rgba(15,23,42,.12),
+            0 0 0 5px rgba(39,205,242,.08);
+          z-index:9999;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          transition:opacity .2s ease, transform .2s ease, box-shadow .2s ease, width .2s ease, height .2s ease;
+          animation:scrollJumpPulse 1.8s ease-in-out infinite;
+        }
+        .scroll-jump.is-top{
+          width:34px;
+          height:34px;
+          background:#fff;
+          color:#0f172a;
+          border-color:rgba(39,205,242,.26);
+          box-shadow:
+            0 10px 24px rgba(15,23,42,.12),
+            0 0 0 5px rgba(39,205,242,.08);
+        }
+        .scroll-jump.is-bottom{
+          width:40px;
+          height:40px;
+          background:#27cdf2;
+          color:#fff;
+          border-color:rgba(39,205,242,.55);
+          box-shadow:
+            0 14px 28px rgba(39,205,242,.42),
+            0 0 0 7px rgba(39,205,242,.16);
+        }
+        .scroll-jump:hover{
+          transform:translateX(-50%) translateY(-1px);
+        }
+        .scroll-jump:active{
+          transform:translateX(-50%) translateY(1px);
+        }
+        @keyframes scrollJumpPulse{
+          0%, 100%{
+            box-shadow:
+              0 10px 24px rgba(39,205,242,.32),
+              0 0 0 5px rgba(39,205,242,.12);
+          }
+          50%{
+            box-shadow:
+              0 14px 28px rgba(39,205,242,.42),
+              0 0 0 8px rgba(39,205,242,.18);
+          }
+        }
+      </style>
+
+      <section id="descargas" class="tab-content">
+        <div id="actions"></div>
+      </section>
+    </main>
+    <button id="scroll-jump" class="scroll-jump" type="button" aria-label="Ir abajo">⌄</button>
+    
+
+    <div class="footer-banner">Desarrollado por OnePepper!!!</div>
+  </div>
+
+  <!-- IMPORTANTE: usa type="module" y esta ruta exacta -->
+  <script type="module" src="popup/main.js"></script>
+</body>
+</html>

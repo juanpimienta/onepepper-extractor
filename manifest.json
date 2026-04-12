@@ -1,0 +1,87 @@
+{
+  "manifest_version": 3,
+  "name": "Extractor de Datos",
+  "version": "5.19.4",
+  "description": "Extrae H1, correos, teléfonos, redes, enlaces clave y tecnología; descarga CSV/Excel (con pago).",
+
+  "icons": {
+    "16":  "icons/state/pepper-azul-16.png",
+    "24":  "icons/state/pepper-azul-24.png",
+    "32":  "icons/state/pepper-azul-32.png",
+    "48":  "icons/state/pepper-azul-48.png",
+    "64":  "icons/state/pepper-azul-64.png",
+    "128": "icons/state/pepper-azul-128.png"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Extractor de Datos",
+    "default_icon": {
+      "16": "icons/state/pepper-rojo-16.png",
+      "24": "icons/state/pepper-rojo-24.png",
+      "32": "icons/state/pepper-rojo-32.png"
+    }
+  },
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "storage",
+    "clipboardWrite",
+    "downloads"
+  ],
+
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/main.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icons/**",
+        "icons/*.png",
+        "icons/state/*.png",
+        "icons/tech/*.svg",
+        "icons/tech/svg/*.svg",
+        "icons/social/svg/*.svg",
+        "icons/flags/*.svg",
+        "libs/*.js",
+        "content/utils.js",
+        "content/extractors/*.js",
+        "content/extractors/phones/*.js",
+        "content/extractors/phones/index.js",
+        "content/extractors/phones/_rules.js",
+        "content/extractors/phones/_country-factory.js",
+        "content/extractors/phones/_shared.js",
+        "content/extractors/phones/ES.js",
+        "content/extractors/phones/FR.js",
+        "content/extractors/phones/IT.js",
+        "content/extractors/phones/INTL.js",
+        "popup/main.js",
+        "popup/services/*.js",
+        "popup/ui/*.js",
+        "payment/*.js",
+        "payment/ui/*.js",
+        "payment/processors/*.js",
+        "privacy/*.html",
+        "privacy/*.css"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

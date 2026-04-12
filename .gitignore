@@ -1,0 +1,26 @@
+.DS_Store
+
+# Environment variables
+.env
+.env.*
+!.env.example
+!billing-backend/.env.example
+
+# Node / package managers
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local backend data
+billing-backend/data/
+
+# Build / cache
+dist/
+build/
+.cache/
+
+# Editor / OS
+.vscode/
+.idea/
