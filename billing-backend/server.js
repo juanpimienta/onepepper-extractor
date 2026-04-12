@@ -98,6 +98,18 @@ function findLicenseBySubscriptionId(store, subscriptionId = "") {
   return Object.values(store.licenses).find((license) => license.subscriptionId === target) || null;
 }
 
+function findLicenseByOrderId(store, orderId = "") {
+  const target = String(orderId || "").trim();
+  if (!target) return null;
+  return Object.values(store.licenses).find((license) => String(license.orderId || "") === target) || null;
+}
+
+function findLicenseByCustomerId(store, customerId = "") {
+  const target = String(customerId || "").trim();
+  if (!target) return null;
+  return Object.values(store.licenses).find((license) => String(license.customerId || "") === target) || null;
+}
+
 function upsertLicense(store, installId) {
   const key = String(installId || "").trim();
   if (!key) return null;
@@ -132,6 +144,21 @@ function applySubscriptionToLicense(license, payload = {}) {
   license.endsAt = attrs.ends_at || license.endsAt || "";
   license.trialEndsAt = attrs.trial_ends_at || license.trialEndsAt || "";
   license.urls = attrs.urls || license.urls || {};
+  license.checkoutSource = String(custom.source || license.checkoutSource || "");
+  license.billingPlan = String(custom.plan || license.billingPlan || "");
+  license.updatedAt = new Date().toISOString();
+}
+
+function applyOrderToLicense(license, payload = {}) {
+  if (!license) return;
+  const attrs = getAttributes(payload);
+  const custom = getCustomData(payload);
+  license.orderId = String(payload?.data?.id || attrs.identifier || attrs.order_id || license.orderId || "");
+  license.customerId = String(attrs.customer_id || license.customerId || "");
+  license.productId = String(attrs.product_id || license.productId || "");
+  license.storeId = String(attrs.store_id || license.storeId || "");
+  license.userEmail = String(attrs.user_email || license.userEmail || "");
+  license.userName = String(attrs.user_name || license.userName || "");
   license.checkoutSource = String(custom.source || license.checkoutSource || "");
   license.billingPlan = String(custom.plan || license.billingPlan || "");
   license.updatedAt = new Date().toISOString();
@@ -192,9 +219,21 @@ app.post("/api/lemonsqueezy/webhook", express.raw({ type: "application/json" }),
   const attrs = getAttributes(payload);
   const store = await readStore();
 
+  if (eventName === "order_created") {
+    const installId = getInstallId(payload);
+    const existing =
+      findLicenseByOrderId(store, payload?.data?.id || attrs.identifier || attrs.order_id || "")
+      || findLicenseByCustomerId(store, attrs.customer_id || "");
+    const license = upsertLicense(store, installId || existing?.installId || "");
+    applyOrderToLicense(license, payload);
+  }
+
   if (eventName.startsWith("subscription_")) {
     const installId = getInstallId(payload);
-    const existing = findLicenseBySubscriptionId(store, payload?.data?.id || attrs.subscription_id || "");
+    const existing =
+      findLicenseBySubscriptionId(store, payload?.data?.id || attrs.subscription_id || "")
+      || findLicenseByOrderId(store, attrs.order_id || "")
+      || findLicenseByCustomerId(store, attrs.customer_id || "");
     const license = upsertLicense(store, installId || existing?.installId || "");
     applySubscriptionToLicense(license, payload);
 
@@ -209,6 +248,8 @@ app.post("/api/lemonsqueezy/webhook", express.raw({ type: "application/json" }),
     const attrsLicense = getAttributes(payload);
     const existing =
       findLicenseBySubscriptionId(store, attrsLicense.subscription_id || "")
+      || findLicenseByOrderId(store, attrsLicense.order_id || "")
+      || findLicenseByCustomerId(store, attrsLicense.customer_id || "")
       || store.licenses[installId];
     const license = upsertLicense(store, installId || existing?.installId || "");
     applyLicenseKeyToLicense(license, payload);
