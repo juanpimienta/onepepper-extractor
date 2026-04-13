@@ -24,6 +24,13 @@ export async function getCachedLicenseState() {
   };
 }
 
+export async function invalidateLicenseCache() {
+  await chrome.storage.local.set({
+    [LICENSE_CACHE_KEY]: null,
+    [LICENSE_LAST_SYNC_KEY]: 0
+  });
+}
+
 export async function syncLicenseStatus({ force = false, maxAgeMs = 5 * 60 * 1000 } = {}) {
   const { cache, lastSyncAt } = await getCachedLicenseState();
   const now = Date.now();
@@ -56,4 +63,3 @@ export async function syncLicenseStatus({ force = false, maxAgeMs = 5 * 60 * 100
 
   return { ok: true, cached: false, ...next };
 }
-

@@ -161,10 +161,66 @@ function applyInvoiceToLicense(license, invoice = {}) {
   license.updatedAt = new Date().toISOString();
 }
 
+function getChargeSubscriptionId(charge = {}) {
+  const invoice = charge.invoice;
+  if (!invoice || typeof invoice === "string") return "";
+  if (typeof invoice.subscription === "string") return invoice.subscription;
+  return String(invoice.subscription?.id || "");
+}
+
+function getChargeCustomerId(charge = {}) {
+  return String(charge.customer || "");
+}
+
+function applyRefundToLicense(license, refund = {}, charge = {}) {
+  if (!license) return;
+
+  const refundStatus = String(refund.status || "").toLowerCase();
+  const chargeAmount = Number(charge.amount || 0);
+  const amountRefunded = Number(charge.amount_refunded || refund.amount || 0);
+  const fullRefund = chargeAmount > 0 && amountRefunded >= chargeAmount;
+
+  license.provider = "stripe";
+  license.lastRefundId = String(refund.id || license.lastRefundId || "");
+  license.lastChargeId = String(charge.id || license.lastChargeId || "");
+  license.refundStatus = refundStatus || license.refundStatus || "";
+  license.refundedAmount = amountRefunded || license.refundedAmount || 0;
+  license.updatedAt = new Date().toISOString();
+
+  if (refundStatus === "failed") {
+    license.refundFailedAt = new Date().toISOString();
+    return;
+  }
+
+  if (refundStatus === "succeeded" && fullRefund) {
+    license.plan = "free";
+    license.premium = false;
+    license.status = "refunded";
+    license.currentPeriodEnd = "";
+  }
+}
+
 async function fetchSubscription(subscriptionId) {
   if (!stripe || !subscriptionId) return null;
   try {
     return await stripe.subscriptions.retrieve(subscriptionId);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchChargeForRefund(refund = {}) {
+  if (!stripe) return null;
+  const chargeId = typeof refund.charge === "string"
+    ? refund.charge
+    : (refund.charge?.id || "");
+
+  if (!chargeId) return null;
+
+  try {
+    return await stripe.charges.retrieve(chargeId, {
+      expand: ["invoice.subscription"]
+    });
   } catch {
     return null;
   }
@@ -231,6 +287,18 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         const subscription = await fetchSubscription(existing.subscriptionId);
         if (subscription) applySubscriptionToLicense(existing, subscription);
       }
+    }
+  }
+
+  if (event.type === "refund.created" || event.type === "refund.updated" || event.type === "refund.failed") {
+    const refund = event.data.object;
+    const charge = await fetchChargeForRefund(refund);
+    const existing =
+      findLicenseBySubscriptionId(store, getChargeSubscriptionId(charge || {}))
+      || findLicenseByCustomerId(store, getChargeCustomerId(charge || {}));
+
+    if (existing) {
+      applyRefundToLicense(existing, refund, charge || {});
     }
   }
 
@@ -324,7 +392,7 @@ app.get("/billing/success", (req, res) => {
       <body style="font-family:Arial,sans-serif;padding:32px;">
         <h1>Pago completado</h1>
         <p>Tu suscripcion premium se esta activando.</p>
-        <p>Vuelve a abrir la extension en unos segundos para sincronizar Premium.</p>
+        <p>Vuelve al popup de la extension. La licencia se sincronizara automaticamente al regresar.</p>
         <p><small>installId: ${String(req.query.installId || "")}</small></p>
       </body>
     </html>

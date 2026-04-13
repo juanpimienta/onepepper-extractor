@@ -8,12 +8,14 @@ import { useTwoColumnLayout } from "./ui/layout-grid.js";
 import {
   canDownload,
   getAccessState,
-  registerDownload
+  registerDownload,
+  setUserPlan
 } from "./services/access.js";
-import { getOrCreateInstallId, syncLicenseStatus } from "./services/license.js";
+import { getCachedLicenseState, getOrCreateInstallId, invalidateLicenseCache, syncLicenseStatus } from "./services/license.js";
 import { renderPlanStatus } from "./ui/render-plan-status.js";
 import { showInfoModal } from "./ui/modal.js";
 import { MAX_REMOTE_BATCH_URLS, parseBatchUrls, scanUrlWithExtractor } from "./services/remote-scan.js";
+import { detectMarketplaceFromURL } from "../content/extractors/marketplace.js";
 
 const STORE_KEY = "extractedDataByOrigin";
 const LEGACY_KEY = "extractedData";
@@ -25,6 +27,29 @@ const DEEP_SCAN_FRESH_MS = 1000 * 60 * 60 * 24;
 
 let CURRENT_ISO = "ES";
 let CURRENT_CC  = "";
+
+async function openStripeCheckout({ source = "premium-upgrade", plan = "month" } = {}) {
+  try {
+    await invalidateLicenseCache().catch(() => {});
+    const installId = await getOrCreateInstallId();
+    const res = await chrome.runtime.sendMessage({ type: "OPEN_CHECKOUT", plan, source, installId });
+    if (res?.ok) return true;
+
+    await showInfoModal({
+      title: "No se pudo abrir Premium",
+      message: res?.message || "El checkout no respondio correctamente. Recarga la extension y vuelve a intentarlo.",
+      okText: "Entendido"
+    });
+    return false;
+  } catch (error) {
+    await showInfoModal({
+      title: "No se pudo abrir Premium",
+      message: error?.message || "La extension no pudo abrir el checkout. Recarga la extension y vuelve a intentarlo.",
+      okText: "Entendido"
+    });
+    return false;
+  }
+}
 
 async function openPremiumUpsell({ source = "premium-feature", reason = "premium" } = {}) {
   const title = reason === "downloads-limit"
@@ -41,14 +66,7 @@ async function openPremiumUpsell({ source = "premium-feature", reason = "premium
   });
 
   if (!wantsUpgrade) return false;
-
-  try {
-    const installId = await getOrCreateInstallId();
-    const res = await chrome.runtime.sendMessage({ type: "OPEN_CHECKOUT", plan: "premium", source, installId });
-    return !!res?.ok;
-  } catch {
-    return false;
-  }
+  return openStripeCheckout({ source, plan: "month" });
 }
 
 /* ---------- helpers país/CC ---------- */
@@ -463,11 +481,27 @@ function aggregateStatsFromStore(store){
 function resetGrid(root, refs){
   root.innerHTML = "";
   const g = document.createElement("div");
-  g.className = "grid-2";
-  g.innerHTML = `<div id="col-left"></div><div id="col-right"></div>`;
+  g.className = "pair-stack";
+  g.innerHTML = `
+    <div class="pair-row" id="pair-row-top">
+      <div class="pair-cell" id="pair-top-left" data-paired-cell="true"></div>
+      <div class="pair-cell" id="pair-top-right" data-paired-cell="true"></div>
+    </div>
+    <div class="pair-row" id="pair-row-mid">
+      <div class="pair-cell" id="pair-mid-left" data-paired-cell="true"></div>
+      <div class="pair-cell" id="pair-mid-right" data-paired-cell="true"></div>
+    </div>
+    <div class="pair-row" id="pair-row-bottom">
+      <div class="pair-cell" id="pair-bottom-left" data-paired-cell="true"></div>
+      <div class="pair-cell" id="pair-bottom-right" data-paired-cell="true"></div>
+    </div>`;
   root.appendChild(g);
-  refs.colL = g.querySelector("#col-left");
-  refs.colR = g.querySelector("#col-right");
+  refs.topL = g.querySelector("#pair-top-left");
+  refs.topR = g.querySelector("#pair-top-right");
+  refs.midL = g.querySelector("#pair-mid-left");
+  refs.midR = g.querySelector("#pair-mid-right");
+  refs.bottomL = g.querySelector("#pair-bottom-left");
+  refs.bottomR = g.querySelector("#pair-bottom-right");
 }
 
 /* =================== BOOTSTRAP =================== */
@@ -539,15 +573,34 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   // Tipografía compacta + Grid fluido
-  installPopupTypography({ base: 11, h1: 13, small: 10, compact: true });
-  useTwoColumnLayout({ colMin: 228, gap: 10, sidePadding: 10 });
+  installPopupTypography({ base: 12, h1: 14, small: 11, compact: true });
+  useTwoColumnLayout({ colMin: 228, gap: 8, sidePadding: 8 });
 
   // Grid debajo del header
   const grid = document.createElement("div");
-  grid.className = "grid-2";
-  grid.innerHTML = `<div id="col-left"></div><div id="col-right"></div>`;
+  grid.className = "pair-stack";
+  grid.innerHTML = `
+    <div class="pair-row" id="pair-row-top">
+      <div class="pair-cell" id="pair-top-left" data-paired-cell="true"></div>
+      <div class="pair-cell" id="pair-top-right" data-paired-cell="true"></div>
+    </div>
+    <div class="pair-row" id="pair-row-mid">
+      <div class="pair-cell" id="pair-mid-left" data-paired-cell="true"></div>
+      <div class="pair-cell" id="pair-mid-right" data-paired-cell="true"></div>
+    </div>
+    <div class="pair-row" id="pair-row-bottom">
+      <div class="pair-cell" id="pair-bottom-left" data-paired-cell="true"></div>
+      <div class="pair-cell" id="pair-bottom-right" data-paired-cell="true"></div>
+    </div>`;
   root.appendChild(grid);
-  const refs = { colL: grid.querySelector("#col-left"), colR: grid.querySelector("#col-right") };
+  const refs = {
+    topL: grid.querySelector("#pair-top-left"),
+    topR: grid.querySelector("#pair-top-right"),
+    midL: grid.querySelector("#pair-mid-left"),
+    midR: grid.querySelector("#pair-mid-right"),
+    bottomL: grid.querySelector("#pair-bottom-left"),
+    bottomR: grid.querySelector("#pair-bottom-right")
+  };
 
   installCopyHandlers(document);
 
@@ -587,16 +640,39 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Módulos
   let runExtractionOnActiveTab, renderH1, renderContacts, renderLinks, renderSocial, renderTechnology, renderActions, exportToExcel, exportToCSV, renderRemoteScanUi;
   try {
-    ({ runExtractionOnActiveTab } = await import("./services/extract.js"));
-    ({ renderH1 }         = await import("./ui/render-h1.js"));
-    ({ renderContacts }   = await import("./ui/render-contacts.js"));
-    ({ renderLinks }      = await import("./ui/render-links.js"));
-    ({ renderSocial }     = await import("./ui/render-social.js"));
-    ({ renderTechnology } = await import("./ui/render-technology.js"));
-    ({ renderActions }    = await import("./ui/render-actions.js"));
-    ({ exportToExcel }    = await import("./services/export-xlsx.js"));
-    ({ exportToCSV }      = await import("./services/export-csv.js"));
-    ({ renderRemoteScan: renderRemoteScanUi } = await import("./ui/render-remote-scan.js"));
+    const [
+      extractMod,
+      h1Mod,
+      contactsMod,
+      linksMod,
+      socialMod,
+      technologyMod,
+      actionsMod,
+      excelMod,
+      csvMod,
+      remoteScanMod
+    ] = await Promise.all([
+      import("./services/extract.js"),
+      import("./ui/render-h1.js"),
+      import("./ui/render-contacts.js"),
+      import("./ui/render-links.js"),
+      import("./ui/render-social.js"),
+      import("./ui/render-technology.js"),
+      import("./ui/render-actions.js"),
+      import("./services/export-xlsx.js"),
+      import("./services/export-csv.js"),
+      import("./ui/render-remote-scan.js")
+    ]);
+    ({ runExtractionOnActiveTab } = extractMod);
+    ({ renderH1 } = h1Mod);
+    ({ renderContacts } = contactsMod);
+    ({ renderLinks } = linksMod);
+    ({ renderSocial } = socialMod);
+    ({ renderTechnology } = technologyMod);
+    ({ renderActions } = actionsMod);
+    ({ exportToExcel } = excelMod);
+    ({ exportToCSV } = csvMod);
+    ({ renderRemoteScan: renderRemoteScanUi } = remoteScanMod);
   } catch (e) {
     toast(alerts, "warning", "Algunos módulos no cargaron.");
     console.error(e);
@@ -625,19 +701,79 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
   ensureLibs().catch(()=>{});
 
-  const { country } = await chrome.storage.local.get("country");
+  const [{ country }, { cache: cachedLicense }] = await Promise.all([
+    chrome.storage.local.get("country"),
+    getCachedLicenseState()
+  ]);
   CURRENT_ISO = country || "ES";
   CURRENT_CC  = ccFromISO(CURRENT_ISO);
-  await syncLicenseStatus({ force: true }).catch(() => {});
+  if (cachedLicense?.plan === "premium" || cachedLicense?.plan === "free") {
+    await setUserPlan(cachedLicense.plan).catch(() => {});
+  }
   let accessState = await getAccessState();
   let handleExcelExport = async () => {};
   let handleCsvExport = async () => {};
+  let deepScanUiState = { enabled: false, marketName: null };
+
+  async function loadDeepScanUiState() {
+    const [{ deepScanEnabled }, activeUrl] = await Promise.all([
+      chrome.storage.local.get({ deepScanEnabled: false }),
+      getActiveTabUrl()
+    ]);
+    deepScanUiState = {
+      enabled: !!deepScanEnabled,
+      marketName: detectMarketplaceFromURL(activeUrl || "")
+    };
+  }
+  await loadDeepScanUiState();
 
   function refreshPlanUi() {
     const lastDeepScanLabel = accessState.lastDeepScanLabel || "";
+    const marketName = deepScanUiState.marketName;
+    const deepLocked = !accessState.canUseDeepExploration;
+    const deepDisabled = deepLocked || !!marketName;
+    const deepSubtitle = deepLocked
+      ? "Disponible solo en Premium."
+      : marketName
+        ? `Desactivada temporalmente en ${marketName}.`
+        : (deepScanUiState.enabled ? "Activa para esta web y las páginas clave." : "Actívala para revisar páginas clave del mismo dominio.");
     renderPlanStatus(planMount, {
       access: { ...accessState, lastDeepScanLabel },
-      onUpgrade: ({ source }) => openPremiumUpsell({ source, reason: "premium" })
+      onUpgrade: ({ source }) => openStripeCheckout({ source, plan: "month" }),
+      deepScan: {
+        enabled: !!deepScanUiState.enabled && !marketName,
+        disabled: deepDisabled,
+        refreshDisabled: deepDisabled,
+        subtitle: deepSubtitle,
+        onToggle: async () => {
+          if (deepLocked) {
+            await openPremiumUpsell({ source: "deep-scan-toggle", reason: "premium" });
+            return;
+          }
+          if (marketName) return;
+          const next = !deepScanUiState.enabled;
+          if (next) {
+            const ok = await showInfoModal({
+              title: "Exploración profunda",
+              message: "Activa la extracción profunda solo en tiendas. Recorre enlaces clave del dominio y puede tardar unos segundos más.",
+              okText: "Entendido"
+            });
+            if (!ok) return;
+          }
+          deepScanUiState.enabled = next;
+          await chrome.storage.local.set({ deepScanEnabled: next });
+          refreshPlanUi();
+          await extractAndRender({ deepScan: next, forceRefresh: true });
+        },
+        onRefresh: async () => {
+          if (deepLocked) {
+            await openPremiumUpsell({ source: "deep-scan-refresh", reason: "premium" });
+            return;
+          }
+          if (marketName) return;
+          await extractAndRender({ deepScan: true, forceRefresh: true });
+        }
+      }
     });
   }
 
@@ -646,6 +782,37 @@ document.addEventListener("DOMContentLoaded", async () => {
     refreshPlanUi();
     return accessState;
   }
+
+  let syncAfterCheckoutBusy = false;
+  async function syncAccessStateAfterFocus() {
+    if (syncAfterCheckoutBusy) return;
+    syncAfterCheckoutBusy = true;
+    try {
+      const res = await syncLicenseStatus({ force: true, maxAgeMs: 0 });
+      if (res?.ok) {
+        await syncAccessState();
+      }
+    } catch {}
+    finally {
+      syncAfterCheckoutBusy = false;
+    }
+  }
+
+  syncLicenseStatus()
+    .then(async (res) => {
+      if (res?.ok) await syncAccessState();
+    })
+    .catch(() => {});
+
+  window.addEventListener("focus", () => {
+    syncAccessStateAfterFocus();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      syncAccessStateAfterFocus();
+    }
+  });
 
   async function scanProvidedUrl(rawUrl, ui = {}) {
     const value = String(rawUrl || "").trim();
@@ -791,8 +958,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   async function renderDataToUi(data, url, footerNote){
-    refs.colL.innerHTML = "";
-    refs.colR.innerHTML = "";
+    refs.topL.innerHTML = "";
+    refs.topR.innerHTML = "";
+    refs.midL.innerHTML = "";
+    refs.midR.innerHTML = "";
+    refs.bottomL.innerHTML = "";
+    refs.bottomR.innerHTML = "";
+    refs.topL.dataset.sourceUrl = url || "";
+    refs.topL.dataset.marketplace = String(!!detectMarketplaceFromURL(url || ""));
 
     const normalized = {
       ...data,
@@ -802,16 +975,17 @@ document.addEventListener("DOMContentLoaded", async () => {
       socialLinks: data?.socialLinks || {}
     };
 
+    try { if (renderH1) renderH1(refs.topL, normalized.h1); } catch (e) { console.error("[UI] h1:", e); }
     try {
       const { techColorMode, themeColor } = await chrome.storage.local.get({ techColorMode: "brand", themeColor: "#111111" });
-      if (renderTechnology) renderTechnology(refs.colR, normalized.technology, { colorMode: techColorMode, themeColor, url });
+      if (renderTechnology) renderTechnology(refs.topR, normalized.technology, { colorMode: techColorMode, themeColor, url });
     } catch (e) { console.error("[UI] technology:", e); }
-    try { if (renderContacts) renderContacts(refs.colR, normalized.emails || [], [], { only: "emails" }); } catch (e) { console.error("[UI] emails:", e); }
-    try { if (renderLinks) renderLinks(refs.colR, normalized.bestLinks); } catch (e) { console.error("[UI] links:", e); }
 
-    try { if (renderH1) renderH1(refs.colL, normalized.h1); } catch (e) { console.error("[UI] h1:", e); }
-    try { if (renderContacts) renderContacts(refs.colL, [], normalized.phones || [], { only: "phones" }); } catch (e) { console.error("[UI] phones:", e); }
-    try { if (renderSocial) renderSocial(refs.colL, normalized.socialLinks); } catch (e) { console.error("[UI] social:", e); }
+    try { if (renderSocial) renderSocial(refs.midL, normalized.socialLinks); } catch (e) { console.error("[UI] social:", e); }
+    try { if (renderLinks) renderLinks(refs.midR, normalized.bestLinks); } catch (e) { console.error("[UI] links:", e); }
+
+    try { if (renderContacts) renderContacts(refs.bottomL, [], normalized.phones || [], { only: "phones" }); } catch (e) { console.error("[UI] phones:", e); }
+    try { if (renderContacts) renderContacts(refs.bottomR, normalized.emails || [], [], { only: "emails" }); } catch (e) { console.error("[UI] emails:", e); }
 
     try {
       if (actions && typeof renderActions === "function") {
@@ -949,34 +1123,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     onCSV: handleCsvExport,
   });
 
-  // Deep Scan toggle
-  try {
-    const { renderDeepScanToggle } = await import("./ui/render-deep-scan.js");
-    const { deepScanEnabled } = await chrome.storage.local.get({ deepScanEnabled: false });
-    renderDeepScanToggle(headerMount, {
-      enabled: deepScanEnabled,
-      locked: !accessState.canUseDeepExploration,
-      onLockedAttempt: () => openPremiumUpsell({ source: "deep-scan-toggle", reason: "premium" }),
-      onChange: async (v) => {
-        const state = await syncAccessState();
-        if (!state.canUseDeepExploration) {
-          await openPremiumUpsell({ source: "deep-scan-toggle", reason: "premium" });
-          return;
-        }
-        await chrome.storage.local.set({ deepScanEnabled: !!v });
-        await extractAndRender({ deepScan: !!v, forceRefresh: true });
-      },
-      onRefreshNow: async () => {
-        const state = await syncAccessState();
-        if (!state.canUseDeepExploration) {
-          await openPremiumUpsell({ source: "deep-scan-refresh", reason: "premium" });
-          return;
-        }
-        await extractAndRender({ deepScan: true, forceRefresh: true });
-      }
-    });
-  } catch (e) { console.error("No se pudo cargar el toggle de deep scan:", e); }
-
   try {
     if (typeof renderRemoteScanUi === "function") {
       renderRemoteScanUi(remoteScanMount, {
@@ -1022,7 +1168,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
       }
 
-      refs.colL.innerHTML = ""; refs.colR.innerHTML = "";
+      refs.topL.innerHTML = ""; refs.topR.innerHTML = "";
+      refs.midL.innerHTML = ""; refs.midR.innerHTML = "";
+      refs.bottomL.innerHTML = ""; refs.bottomR.innerHTML = "";
       toast(alerts, "info", useDeep ? "Procesando datos..." : "Actualizando datos...", 900);
 
       // ⬇️ pasamos SIEMPRE la bandera actual al content

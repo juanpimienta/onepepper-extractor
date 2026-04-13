@@ -12,19 +12,15 @@ export function renderPaywall(container, setPaid){
 
     container.innerHTML = `
       <h2>Pago</h2>
-      <p>Activa Premium con Lemon Squeezy para habilitar descargas ilimitadas y exploracion profunda.</p>
+      <p>Activa Premium con Stripe para habilitar descargas ilimitadas y exploracion profunda.</p>
       <div class="pay-options">
         <button id="pay-month" class="primary-btn">Premium mensual 7,99 €</button>
-        <button id="pay-year" class="primary-btn">Premium anual 49,99 €</button>
       </div>
-      <small class="muted">La opcion anual se mostrara como oferta y la extension sincronizara la licencia premium automaticamente.</small>
+      <small class="muted">La extensión sincronizará la licencia premium automáticamente después del pago.</small>
     `;
 
     container.querySelector("#pay-month").addEventListener("click", async ()=>{
       await Billing.startCheckout("month");
-    });
-    container.querySelector("#pay-year").addEventListener("click", async ()=>{
-      await Billing.startCheckout("year");
     });
   })();
 }

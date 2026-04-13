@@ -40,7 +40,7 @@ async function handleOpenCheckout(msg) {
   if (!checkoutUrl) {
     return {
       ok: false,
-      message: "Configura Lemon Squeezy en shared/billing-config.js antes de abrir el checkout."
+      message: "Configura Stripe en shared/billing-config.js antes de abrir el checkout."
     };
   }
 
