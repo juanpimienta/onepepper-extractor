@@ -1,20 +1,16 @@
 export const BILLING_CONFIG = {
-  provider: "lemonsqueezy",
-  lemonsqueezy: {
-    // Recomendado: backend propio que crea el checkout por API.
-    checkoutBaseUrl: "",
-
-    // Fallback opcional: checkout directo si ya conoces tu subdominio.
-    storeSubdomain: "",
-    variants: {
-      month: "1515006",
-      year: "1515032"
+  provider: "stripe",
+  stripe: {
+    checkoutBaseUrl: "https://onepepper-licensing.onrender.com/api/stripe/checkout",
+    prices: {
+      month: "price_1TLifCF8JKKwNyVlwGJWbh27",
+      year: "price_1TLig1F8JKKwNyVl3NDPXbcI"
     }
   },
   licenseApi: {
     // Endpoint que devuelve el estado premium para un installId.
-    statusUrl: "",
-    bearerToken: "",
+    statusUrl: "https://onepepper-licensing.onrender.com/api/license/status",
+    bearerToken: "onepepper_license_api_2026",
     timeoutMs: 8000
   }
 };
@@ -30,26 +26,15 @@ export function buildCheckoutUrl(rawPlan, context = {}) {
   const plan = resolveBillingPlan(rawPlan);
   const { installId = "", source = "popup" } = context;
 
-  if (BILLING_CONFIG.lemonsqueezy.checkoutBaseUrl) {
-    const url = new URL(BILLING_CONFIG.lemonsqueezy.checkoutBaseUrl);
+  if (BILLING_CONFIG.stripe.checkoutBaseUrl) {
+    const url = new URL(BILLING_CONFIG.stripe.checkoutBaseUrl);
     url.searchParams.set("plan", plan);
     if (installId) url.searchParams.set("installId", installId);
     if (source) url.searchParams.set("source", source);
     url.searchParams.set("platform", "chrome_extension");
     return url.toString();
   }
-
-  const subdomain = String(BILLING_CONFIG.lemonsqueezy.storeSubdomain || "").trim();
-  const variantId = BILLING_CONFIG.lemonsqueezy.variants?.[plan] || "";
-  if (!subdomain || !variantId) return "";
-
-  const url = new URL(`https://${subdomain}.lemonsqueezy.com/checkout/buy/${variantId}`);
-  if (installId) url.searchParams.set("checkout[custom][installId]", installId);
-  if (source) url.searchParams.set("checkout[custom][source]", source);
-  url.searchParams.set("checkout[custom][plan]", plan);
-  url.searchParams.set("checkout[custom][platform]", "chrome_extension");
-  url.searchParams.set("checkout[lang]", "es");
-  return url.toString();
+  return "";
 }
 
 export function buildLicenseStatusUrl(installId = "") {
