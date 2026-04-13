@@ -3,8 +3,8 @@ export const BILLING_CONFIG = {
   stripe: {
     checkoutBaseUrl: "https://onepepper-licensing.onrender.com/api/stripe/checkout",
     prices: {
-      month: "price_1TLlWVF8JKKwNyVlwZKrskmX",
-      year: "price_1TLlQSF8JKKwNyVlgw131SBL"
+      month: "price_1TLhigF8JKKwNyVlisaiLmS7",
+      year: "price_1TLhigF8JKKwNyVlmfKMmsGC"
     }
   },
   licenseApi: {

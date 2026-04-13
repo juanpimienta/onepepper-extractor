@@ -3,8 +3,8 @@
 ## 1. Datos del producto
 
 - Producto: `Extractor Leads Premium`
-- Mensual `7,99 €`: `price_1TLlWVF8JKKwNyVlwZKrskmX`
-- Anual `49,99 €`: `price_1TLlQSF8JKKwNyVlgw131SBL`
+- Mensual `7,99 €`: `price_1TLhigF8JKKwNyVlisaiLmS7`
+- Anual `49,99 €`: `price_1TLhigF8JKKwNyVlmfKMmsGC`
 
 ## 2. Variables del backend
 
@@ -38,8 +38,8 @@ export const BILLING_CONFIG = {
   stripe: {
     checkoutBaseUrl: "https://tu-backend.onrender.com/api/stripe/checkout",
     prices: {
-      month: "price_1TLlWVF8JKKwNyVlwZKrskmX",
-      year: "price_1TLlQSF8JKKwNyVlgw131SBL"
+      month: "price_1TLhigF8JKKwNyVlisaiLmS7",
+      year: "price_1TLhigF8JKKwNyVlmfKMmsGC"
     }
   },
   licenseApi: {
