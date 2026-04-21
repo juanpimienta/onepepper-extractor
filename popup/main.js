@@ -6,7 +6,6 @@ import { installCopyHandlers } from "./ui/copy.js";
 import { installPopupTypography } from "./ui/typography.js";
 import { useTwoColumnLayout } from "./ui/layout-grid.js";
 import {
-  canDownload,
   getAccessState,
   registerDownload,
   setUserPlan
@@ -27,6 +26,18 @@ const DEEP_SCAN_FRESH_MS = 1000 * 60 * 60 * 24;
 
 let CURRENT_ISO = "ES";
 let CURRENT_CC  = "";
+
+function emptyCountryBucket(){
+  return {
+    h1: "",
+    emails: [],
+    phones: [],
+    bestLinks: { privacy:null, contact:null, legal:null, terms:null },
+    socialLinks: {},
+    technology: "",
+    updatedAt: 0
+  };
+}
 
 async function openStripeCheckout({ source = "premium-upgrade", plan = "month" } = {}) {
   try {
@@ -56,13 +67,13 @@ async function openPremiumUpsell({ source = "premium-feature", reason = "premium
     ? "Has alcanzado el límite del plan gratuito"
     : "Función disponible en Premium";
   const message = reason === "downloads-limit"
-    ? "Ya usaste tus 10 descargas gratuitas. Puedes seguir viendo los resultados extraídos, pero para exportar más o activar exploración profunda necesitas el plan Premium."
-    : "La exploración profunda forma parte del plan Premium. Con Premium tienes exportaciones ilimitadas y acceso completo a esta función.";
+    ? "Ya usaste tus 10 descargas gratuitas. Puedes seguir viendo los resultados extraídos, pero para exportar más o activar exploración profunda necesitas Premium mensual 7,99 €."
+    : "La exploración profunda forma parte de Premium mensual 7,99 €. Con este plan tienes exportaciones ilimitadas y acceso completo a esta función.";
 
   const wantsUpgrade = await showInfoModal({
     title,
     message,
-    okText: "Ver Premium"
+    okText: "Ver Premium mensual"
   });
 
   if (!wantsUpgrade) return false;
@@ -75,6 +86,16 @@ function ccFromISO(iso){
     const meta = (getSupportedCountries()||[]).find(c=>c.iso===iso);
     return meta?.cc ? String(meta.cc) : "";
   } catch { return ""; }
+}
+function countryLabelFromISO(iso){
+  try {
+    const meta = (getSupportedCountries()||[]).find(c=>c.iso===iso);
+    if (!meta) return iso || "";
+    if (meta._world) return "Mundo";
+    return `${meta.name}${meta.cc ? ` (+${meta.cc})` : ""}`;
+  } catch {
+    return iso || "";
+  }
 }
 
 /* ---------- dedupe por DISPLAY (no re-formatea) ---------- */
@@ -128,6 +149,11 @@ function getStoredRecordByUrl(url){
   if (store[url]) return { url, record: store[url] };
   const record = Object.values(store).find((rec) => Array.isArray(rec?.urls) && rec.urls.includes(url));
   return record ? { url, record } : null;
+}
+function getStoredRecordByUrlForCountry(url, iso = CURRENT_ISO){
+  const stored = getStoredRecordByUrl(url);
+  if (!stored) return null;
+  return { ...stored, record: applyCountryBucketToRecord(stored.record, iso) };
 }
 async function getDeepScanMeta(url){
   try {
@@ -195,7 +221,43 @@ function makeEmptyRecord(key, origin, isMarketplace){
   return { key, origin, isMarketplace: !!isMarketplace,
     urls: [], h1: "", emails: [], phones: [],
     bestLinks: { privacy:null, contact:null, legal:null, terms:null },
-    socialLinks: {}, technology:"" };
+    socialLinks: {}, technology:"",
+    countryBuckets: {} };
+}
+function ensureCountryBucket(rec, iso){
+  rec.countryBuckets = rec.countryBuckets || {};
+  if (!rec.countryBuckets[iso]) rec.countryBuckets[iso] = emptyCountryBucket();
+  return rec.countryBuckets[iso];
+}
+function bucketHasData(bucket){
+  if (!bucket) return false;
+  return !!(
+    bucket.h1 ||
+    bucket.technology ||
+    (bucket.emails && bucket.emails.length) ||
+    (bucket.phones && bucket.phones.length) ||
+    Object.values(bucket.bestLinks || {}).some(Boolean) ||
+    Object.values(bucket.socialLinks || {}).some(Boolean)
+  );
+}
+function applyCountryBucketToRecord(rec, iso){
+  if (!rec) return rec;
+  const bucket = rec.countryBuckets?.[iso];
+  if (!bucket || !bucketHasData(bucket)) return rec;
+  return {
+    ...rec,
+    h1: bucket.h1 || "",
+    emails: [...(bucket.emails || [])],
+    phones: [...(bucket.phones || [])],
+    bestLinks: { privacy:null, contact:null, legal:null, terms:null, ...(bucket.bestLinks || {}) },
+    socialLinks: { ...(bucket.socialLinks || {}) },
+    technology: bucket.technology || "",
+    activeCountry: iso,
+    bucketUpdatedAt: bucket.updatedAt || 0
+  };
+}
+function recordHasCountryData(rec, iso){
+  return bucketHasData(rec?.countryBuckets?.[iso]);
 }
 function isBetterTech(cur, inc){
   if (!inc) return false; if (!cur) return true;
@@ -206,31 +268,34 @@ function isBetterH1(cur, inc){
   if (!cur || /no se encontró h1/i.test(cur)) return true;
   return inc.length > cur.length && inc.length <= 140;
 }
-function mergeRecord(existing, url, data, meta){
+function mergeRecord(existing, url, data, meta, countryIso = CURRENT_ISO){
   const { key, origin, isMarketplace } = meta;
   const rec = existing || makeEmptyRecord(key, origin, isMarketplace);
+  const bucket = ensureCountryBucket(rec, countryIso);
   if (!rec.urls.includes(url)) rec.urls.push(url);
-  if (isMarketplace) { if (!rec.h1 && data.h1) rec.h1 = data.h1; }
-  else { if (isBetterH1(rec.h1, data.h1)) rec.h1 = data.h1; }
+  if (isMarketplace) { if (!bucket.h1 && data.h1) bucket.h1 = data.h1; }
+  else { if (isBetterH1(bucket.h1, data.h1)) bucket.h1 = data.h1; }
 
   // Emails: normalizados
-  rec.emails = dedupeEmails([...(rec.emails||[]), ...(data.emails||[])]);
+  bucket.emails = dedupeEmails([...(bucket.emails||[]), ...(data.emails||[])]);
 
   // Teléfonos: dedupe por display, no tocamos formato
-  rec.phones = dedupeDisplayPhones([...(rec.phones||[]), ...(data.phones||[])]);
+  bucket.phones = dedupeDisplayPhones([...(bucket.phones||[]), ...(data.phones||[])]);
 
-  rec.bestLinks = rec.bestLinks || {};
+  bucket.bestLinks = bucket.bestLinks || {};
   ["privacy","contact","legal","terms"].forEach(k=>{
-    if (!rec.bestLinks[k] && data.bestLinks?.[k]) rec.bestLinks[k] = data.bestLinks[k];
+    if (!bucket.bestLinks[k] && data.bestLinks?.[k]) bucket.bestLinks[k] = data.bestLinks[k];
   });
-  rec.socialLinks = rec.socialLinks || {};
+  bucket.socialLinks = bucket.socialLinks || {};
   Object.entries(data.socialLinks || {}).forEach(([k,v])=>{
-    if (!rec.socialLinks[k] && v) rec.socialLinks[k] = v;
+    if (!bucket.socialLinks[k] && v) bucket.socialLinks[k] = v;
   });
 
-  if (isBetterTech(rec.technology, data.technology)) rec.technology = data.technology;
-  if (!rec.technology && data.technology) rec.technology = data.technology;
-  return rec;
+  if (isBetterTech(bucket.technology, data.technology)) bucket.technology = data.technology;
+  if (!bucket.technology && data.technology) bucket.technology = data.technology;
+  bucket.updatedAt = Date.now();
+
+  return applyCountryBucketToRecord(rec, countryIso);
 }
 function migrateLegacyArray(){
   const store = {};
@@ -254,6 +319,7 @@ function migrateLegacyArray(){
 // ---------- export helpers (AOA con encabezado fijo) ----------
 function rowsFromStore(store){
   const HEADERS = [
+    "País",
     "Número",
     "URL",
     "Dominio",
@@ -278,48 +344,79 @@ function rowsFromStore(store){
   const rows = [HEADERS];
 
   const keys = Object.keys(store).sort();
-  const cc = CURRENT_CC || ccFromISO(CURRENT_ISO) || ""; // indicativo país actual
+  const allCountries = Array.from(new Set(
+    keys.flatMap((k) => {
+      const rec = store[k] || {};
+      const bucketKeys = Object.keys(rec.countryBuckets || {}).filter((iso) => bucketHasData(rec.countryBuckets?.[iso]));
+      return bucketKeys.length ? bucketKeys : [CURRENT_ISO];
+    })
+  ));
 
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i];
-    const rec = store[k] || {};
+  for (const iso of allCountries) {
+    rows.push([`País: ${countryLabelFromISO(iso)}`, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]);
+    const cc = ccFromISO(iso) || "";
+    let rowNumber = 1;
 
-    // 1) Normalizaciones
-    const emails = dedupeEmails(rec.emails || []);
-    const phones = dedupePhones(rec.phones || [], { defaultCc: cc });
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const rec = applyCountryBucketToRecord(store[k] || {}, iso);
+      if (!recordHasCountryData(store[k] || {}, iso) && !(iso === CURRENT_ISO && !Object.keys((store[k] || {}).countryBuckets || {}).length)) continue;
 
-    // 2) Campos derivados
-    const numero      = i + 1;
-    const urlExacta   = (rec.urls && rec.urls[0]) || k || ""; // primera URL guardada
-    const dominioLimp = stripDomain(rec.origin || "");
-    const nombre      = rec.h1 || "";
-    const tecnologia  = rec.technology || "";
+      const emails = dedupeEmails(rec.emails || []);
+      const phones = dedupePhones(rec.phones || [], { defaultCc: cc });
 
-    // 3) Enlaces clave
-    const privacidad  = rec.bestLinks?.privacy  || "";
-    const contacto    = rec.bestLinks?.contact  || "";
-    const legal       = rec.bestLinks?.legal    || "";
-    const terminos    = rec.bestLinks?.terms    || "";
+      const numero      = rowNumber++;
+      const urlExacta   = (rec.urls && rec.urls[0]) || k || "";
+      const dominioLimp = stripDomain(rec.origin || "");
+      const nombre      = rec.h1 || "";
+      const tecnologia  = rec.technology || "";
+      const privacidad  = rec.bestLinks?.privacy  || "";
+      const contacto    = rec.bestLinks?.contact  || "";
+      const legal       = rec.bestLinks?.legal    || "";
+      const terminos    = rec.bestLinks?.terms    || "";
+      const facebook = rec.socialLinks?.facebook || "";
+      const tiktok   = rec.socialLinks?.tiktok   || "";
+      const insta    = rec.socialLinks?.instagram|| "";
+      const linkedin = rec.socialLinks?.linkedin || "";
+      const twitter  = rec.socialLinks?.twitter  || "";
+      const youtube  = rec.socialLinks?.youtube  || "";
+      const pinterest= rec.socialLinks?.pinterest|| "";
+      const whatsapp = rec.socialLinks?.whatsapp || "";
 
-    // 4) Redes
-    const facebook = rec.socialLinks?.facebook || "";
-    const tiktok   = rec.socialLinks?.tiktok   || "";
-    const insta    = rec.socialLinks?.instagram|| "";
-    const linkedin = rec.socialLinks?.linkedin || "";
-    const twitter  = rec.socialLinks?.twitter  || "";
-    const youtube  = rec.socialLinks?.youtube  || "";
-    const pinterest= rec.socialLinks?.pinterest|| "";
-    const whatsapp = rec.socialLinks?.whatsapp || "";
+      if (!emails.length) {
+        rows.push([
+          countryLabelFromISO(iso),
+          numero,
+          urlExacta,
+          dominioLimp,
+          nombre,
+          tecnologia,
+          "",
+          phones.join(", "),
+          whatsapp,
+          privacidad,
+          contacto,
+          legal,
+          terminos,
+          facebook,
+          tiktok,
+          insta,
+          linkedin,
+          twitter,
+          youtube,
+          pinterest
+        ]);
+        continue;
+      }
 
-    // Si NO hay correos → una sola fila “normal”
-    if (!emails.length) {
       rows.push([
+        countryLabelFromISO(iso),
         numero,
         urlExacta,
         dominioLimp,
         nombre,
         tecnologia,
-        "",                  // Correos vacío
+        emails[0],
         phones.join(", "),
         whatsapp,
         privacidad,
@@ -334,55 +431,31 @@ function rowsFromStore(store){
         youtube,
         pinterest
       ]);
-      continue;
-    }
 
-    // Fila principal (primer correo) con todos los datos
-    rows.push([
-      numero,
-      urlExacta,
-      dominioLimp,
-      nombre,
-      tecnologia,
-      emails[0],            // primer correo
-      phones.join(", "),    // teléfonos SOLO en la primera fila
-      whatsapp,
-      privacidad,
-      contacto,
-      legal,
-      terminos,
-      facebook,
-      tiktok,
-      insta,
-      linkedin,
-      twitter,
-      youtube,
-      pinterest
-    ]);
-
-    // Filas adicionales: por cada correo extra, solo Dominio + Correos
-    for (let j = 1; j < emails.length; j++) {
-      rows.push([
-        "",                  // Número
-        "",                  // URL
-        dominioLimp,         // Dominio duplicado
-        "",                  // Nombre
-        "",                  // Tecnología
-        emails[j],           // este correo
-        "",                  // Teléfono
-        "",                  // WhatsApp
-        "",                  // Privacidad
-        "",                  // Contacto
-        "",                  // Legal
-        "",                  // Términos
-        "",                  // Facebook
-        "",                  // TikTok
-        "",                  // Instagram
-        "",                  // LinkedIn
-        "",                  // Twitter
-        "",                  // YouTube
-        ""                   // Pinterest
-      ]);
+      for (let j = 1; j < emails.length; j++) {
+        rows.push([
+          countryLabelFromISO(iso),
+          "",
+          "",
+          dominioLimp,
+          "",
+          "",
+          emails[j],
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ]);
+      }
     }
   }
 
@@ -392,67 +465,78 @@ function rowsFromStore(store){
 function rowsFromStorePro(store){
   const rows = [];
   const keys = Object.keys(store).sort();
-  const cc = CURRENT_CC || ccFromISO(CURRENT_ISO) || "";
+  const allCountries = Array.from(new Set(
+    keys.flatMap((k) => {
+      const rec = store[k] || {};
+      const bucketKeys = Object.keys(rec.countryBuckets || {}).filter((iso) => bucketHasData(rec.countryBuckets?.[iso]));
+      return bucketKeys.length ? bucketKeys : [CURRENT_ISO];
+    })
+  ));
 
-  keys.forEach((k,i)=>{
-    const rec = store[k] || {};
-    const emails = dedupeEmails(rec.emails||[]);
-    const phones = dedupePhones(rec.phones||[], { defaultCc: cc });
-    const dominioLimp = stripDomain(rec.origin || "");
+  allCountries.forEach((iso) => {
+    const cc = ccFromISO(iso) || "";
+    let rowNumber = 1;
+    keys.forEach((k)=>{
+      const source = store[k] || {};
+      const rec = applyCountryBucketToRecord(source, iso);
+      if (!recordHasCountryData(source, iso) && !(iso === CURRENT_ISO && !Object.keys(source.countryBuckets || {}).length)) return;
+      const emails = dedupeEmails(rec.emails||[]);
+      const phones = dedupePhones(rec.phones||[], { defaultCc: cc });
+      const dominioLimp = stripDomain(rec.origin || "");
 
-    const base = {
-      "Número": i+1,
-      "URL": (rec.urls && rec.urls[0]) || k || "",
-      "Dominio": dominioLimp,
-      "H1": rec.h1 || "",
-      "Tecnología": rec.technology || "",
-      "Teléfono": phones.join(", "),
-      "WhatsApp": rec.socialLinks?.whatsapp || "",
-      "Privacidad": rec.bestLinks?.privacy || "",
-      "Contacto": rec.bestLinks?.contact || "",
-      "Legal": rec.bestLinks?.legal || "",
-      "Términos": rec.bestLinks?.terms || "",
-      "Facebook": rec.socialLinks?.facebook || "",
-      "TikTok": rec.socialLinks?.tiktok || "",
-      "Instagram": rec.socialLinks?.instagram || "",
-      "LinkedIn": rec.socialLinks?.linkedin || "",
-      "Twitter": rec.socialLinks?.twitter || "",
-      "YouTube": rec.socialLinks?.youtube || "",
-      "Pinterest": rec.socialLinks?.pinterest || ""
-    };
-
-    if (!emails.length) {
-      rows.push({ ...base, "Correos": "" });
-      return;
-    }
-
-    // Primer correo: fila completa
-    rows.push({ ...base, "Correos": emails[0] });
-
-    // Correos adicionales: solo Dominio + Correos (lo demás vacío)
-    for (let j = 1; j < emails.length; j++) {
-      rows.push({
-        "Número": "",
-        "URL": "",
+      const base = {
+        "País": countryLabelFromISO(iso),
+        "Número": rowNumber++,
+        "URL": (rec.urls && rec.urls[0]) || k || "",
         "Dominio": dominioLimp,
-        "H1": "",
-        "Tecnología": "",
-        "Correos": emails[j],
-        "Teléfono": "",
-        "WhatsApp": "",
-        "Privacidad": "",
-        "Contacto": "",
-        "Legal": "",
-        "Términos": "",
-        "Facebook": "",
-        "TikTok": "",
-        "Instagram": "",
-        "LinkedIn": "",
-        "Twitter": "",
-        "YouTube": "",
-        "Pinterest": ""
-      });
-    }
+        "H1": rec.h1 || "",
+        "Tecnología": rec.technology || "",
+        "Teléfono": phones.join(", "),
+        "WhatsApp": rec.socialLinks?.whatsapp || "",
+        "Privacidad": rec.bestLinks?.privacy || "",
+        "Contacto": rec.bestLinks?.contact || "",
+        "Legal": rec.bestLinks?.legal || "",
+        "Términos": rec.bestLinks?.terms || "",
+        "Facebook": rec.socialLinks?.facebook || "",
+        "TikTok": rec.socialLinks?.tiktok || "",
+        "Instagram": rec.socialLinks?.instagram || "",
+        "LinkedIn": rec.socialLinks?.linkedin || "",
+        "Twitter": rec.socialLinks?.twitter || "",
+        "YouTube": rec.socialLinks?.youtube || "",
+        "Pinterest": rec.socialLinks?.pinterest || ""
+      };
+
+      if (!emails.length) {
+        rows.push({ ...base, "Correos": "" });
+        return;
+      }
+
+      rows.push({ ...base, "Correos": emails[0] });
+      for (let j = 1; j < emails.length; j++) {
+        rows.push({
+          "País": countryLabelFromISO(iso),
+          "Número": "",
+          "URL": "",
+          "Dominio": dominioLimp,
+          "H1": "",
+          "Tecnología": "",
+          "Correos": emails[j],
+          "Teléfono": "",
+          "WhatsApp": "",
+          "Privacidad": "",
+          "Contacto": "",
+          "Legal": "",
+          "Términos": "",
+          "Facebook": "",
+          "TikTok": "",
+          "Instagram": "",
+          "LinkedIn": "",
+          "Twitter": "",
+          "YouTube": "",
+          "Pinterest": ""
+        });
+      }
+    });
   });
 
   return rows;
@@ -466,12 +550,17 @@ function stripDomain(urlOrOrigin=""){
 
 function aggregateStatsFromStore(store){
   const allEmails = []; const allPhones = [];
-  Object.values(store).forEach(rec=>{
-    if (rec?.emails?.length) allEmails.push(...rec.emails);
-    if (rec?.phones?.length) allPhones.push(...rec.phones);
+  let registros = 0;
+  Object.values(store).forEach(source=>{
+    const rec = applyCountryBucketToRecord(source, CURRENT_ISO);
+    if (recordHasCountryData(source, CURRENT_ISO) || !Object.keys(source?.countryBuckets || {}).length) {
+      registros += 1;
+      if (rec?.emails?.length) allEmails.push(...rec.emails);
+      if (rec?.phones?.length) allPhones.push(...rec.phones);
+    }
   });
   return {
-    registros: Object.keys(store).length,
+    registros,
     emails: dedupeEmails(allEmails).length,
     phones: dedupeDisplayPhones(allPhones).length
   };
@@ -574,7 +663,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Tipografía compacta + Grid fluido
   installPopupTypography({ base: 12, h1: 14, small: 11, compact: true });
-  useTwoColumnLayout({ colMin: 228, gap: 8, sidePadding: 8 });
+  useTwoColumnLayout({ colMin: 228, gap: 8, sidePadding: 0 });
 
   // Grid debajo del header
   const grid = document.createElement("div");
@@ -638,7 +727,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   // Módulos
-  let runExtractionOnActiveTab, renderH1, renderContacts, renderLinks, renderSocial, renderTechnology, renderActions, exportToExcel, exportToCSV, renderRemoteScanUi;
+  let runExtractionOnActiveTab, renderH1, renderContacts, renderLinks, renderSocial, renderTechnology, renderActions, exportToExcel, exportToCSV, exportToJSON, renderRemoteScanUi;
   try {
     const [
       extractMod,
@@ -650,6 +739,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       actionsMod,
       excelMod,
       csvMod,
+      jsonMod,
       remoteScanMod
     ] = await Promise.all([
       import("./services/extract.js"),
@@ -661,6 +751,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       import("./ui/render-actions.js"),
       import("./services/export-xlsx.js"),
       import("./services/export-csv.js"),
+      import("./services/export-json.js"),
       import("./ui/render-remote-scan.js")
     ]);
     ({ runExtractionOnActiveTab } = extractMod);
@@ -672,6 +763,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     ({ renderActions } = actionsMod);
     ({ exportToExcel } = excelMod);
     ({ exportToCSV } = csvMod);
+    ({ exportToJSON } = jsonMod);
     ({ renderRemoteScan: renderRemoteScanUi } = remoteScanMod);
   } catch (e) {
     toast(alerts, "warning", "Algunos módulos no cargaron.");
@@ -711,9 +803,54 @@ document.addEventListener("DOMContentLoaded", async () => {
     await setUserPlan(cachedLicense.plan).catch(() => {});
   }
   let accessState = await getAccessState();
+  let lastQueryLabel = "";
   let handleExcelExport = async () => {};
   let handleCsvExport = async () => {};
+  let handleJsonExport = async () => {};
   let deepScanUiState = { enabled: false, marketName: null };
+
+  function currentHeaderStats() {
+    return aggregateStatsFromStore(loadStore());
+  }
+
+  function renderHeaderUi() {
+    renderHeader(headerMount, {
+      country: CURRENT_ISO,
+      stats: currentHeaderStats(),
+      access: { ...accessState, lastQueryLabel },
+      deepScan: {
+        enabled: !!deepScanUiState.enabled && !deepScanUiState.marketName,
+        onToggle: async () => {
+          const deepLocked = !accessState.canUseDeepExploration;
+          const marketName = deepScanUiState.marketName;
+          if (deepLocked) {
+            await openPremiumUpsell({ source: "deep-scan-toggle", reason: "premium" });
+            return;
+          }
+          if (marketName) return;
+          const next = !deepScanUiState.enabled;
+          if (next) {
+            const ok = await showInfoModal({
+              title: "Exploración profunda",
+              message: "Activa la extracción profunda solo en tiendas. Recorre enlaces clave del dominio y puede tardar unos segundos más.",
+              okText: "Entendido"
+            });
+            if (!ok) return;
+          }
+          deepScanUiState.enabled = next;
+          await chrome.storage.local.set({ deepScanEnabled: next });
+          refreshPlanUi();
+          await extractAndRender({ deepScan: next, forceRefresh: true });
+        }
+      },
+      onUpgrade: ({ source }) => openStripeCheckout({ source, plan: "month" }),
+      onRefresh: () => extractAndRender({ deepScan: !!deepScanUiState.enabled, forceRefresh: true }),
+      onCountryChange: onCountryChanged,
+      onExcel: handleExcelExport,
+      onCSV: handleCsvExport,
+      onJSON: handleJsonExport,
+    });
+  }
 
   async function loadDeepScanUiState() {
     const [{ deepScanEnabled }, activeUrl] = await Promise.all([
@@ -728,6 +865,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadDeepScanUiState();
 
   function refreshPlanUi() {
+    renderHeaderUi();
     const lastDeepScanLabel = accessState.lastDeepScanLabel || "";
     const marketName = deepScanUiState.marketName;
     const deepLocked = !accessState.canUseDeepExploration;
@@ -738,7 +876,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         ? `Desactivada temporalmente en ${marketName}.`
         : (deepScanUiState.enabled ? "Activa para esta web y las páginas clave." : "Actívala para revisar páginas clave del mismo dominio.");
     renderPlanStatus(planMount, {
-      access: { ...accessState, lastDeepScanLabel },
+      access: { ...accessState, lastDeepScanLabel, lastQueryLabel },
       onUpgrade: ({ source }) => openStripeCheckout({ source, plan: "month" }),
       deepScan: {
         enabled: !!deepScanUiState.enabled && !marketName,
@@ -781,6 +919,42 @@ document.addEventListener("DOMContentLoaded", async () => {
     accessState = await getAccessState();
     refreshPlanUi();
     return accessState;
+  }
+
+  async function buildExportPayload(format, rowsCount) {
+    const activeUrl = await getActiveTabUrl();
+    let domain = "";
+    try { domain = activeUrl ? new URL(activeUrl).hostname.replace(/^www\./i, "") : ""; } catch {}
+    return {
+      format,
+      country: CURRENT_ISO,
+      recordsCount: Math.max(0, Number(rowsCount || 0)),
+      domain
+    };
+  }
+
+  async function authorizeExport(format, rowsCount) {
+    const payload = await buildExportPayload(format, rowsCount);
+    const allowed = await syncAccessState();
+
+    if (!allowed.canDownload) {
+      await openPremiumUpsell({ source: `${format}-export`, reason: "downloads-limit" });
+      return null;
+    }
+
+    const usage = await registerDownload(payload);
+    if (!usage.allowed) {
+      await syncAccessState();
+      if (usage.reason === "downloads_limit") {
+        await openPremiumUpsell({ source: `${format}-export`, reason: "downloads-limit" });
+      } else {
+        toast(alerts, "error", usage.message || "No se pudo validar la exportación.");
+      }
+      return null;
+    }
+
+    await syncAccessState();
+    return usage;
   }
 
   let syncAfterCheckoutBusy = false;
@@ -882,7 +1056,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           try {
             const meta = computeKey(url, data.technology);
             const store = loadStore();
-            finalRecord = mergeRecord(store[meta.key], url, data, meta);
+            finalRecord = mergeRecord(store[meta.key], url, data, meta, CURRENT_ISO);
             store[meta.key] = finalRecord;
             saveStore(store);
             updateHeaderStats(headerMount, aggregateStatsFromStore(store));
@@ -974,6 +1148,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       bestLinks: data?.bestLinks || {},
       socialLinks: data?.socialLinks || {}
     };
+    lastQueryLabel = `Ultima consulta: ${(normalized.emails?.length || 0) + (normalized.phones?.length || 0)} registros.`;
 
     try { if (renderH1) renderH1(refs.topL, normalized.h1); } catch (e) { console.error("[UI] h1:", e); }
     try {
@@ -981,21 +1156,17 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (renderTechnology) renderTechnology(refs.topR, normalized.technology, { colorMode: techColorMode, themeColor, url });
     } catch (e) { console.error("[UI] technology:", e); }
 
-    try { if (renderSocial) renderSocial(refs.midL, normalized.socialLinks); } catch (e) { console.error("[UI] social:", e); }
-    try { if (renderLinks) renderLinks(refs.midR, normalized.bestLinks); } catch (e) { console.error("[UI] links:", e); }
+    try { if (renderContacts) renderContacts(refs.midL, [], normalized.phones || [], { only: "phones" }); } catch (e) { console.error("[UI] phones:", e); }
+    try { if (renderContacts) renderContacts(refs.midR, normalized.emails || [], [], { only: "emails" }); } catch (e) { console.error("[UI] emails:", e); }
 
-    try { if (renderContacts) renderContacts(refs.bottomL, [], normalized.phones || [], { only: "phones" }); } catch (e) { console.error("[UI] phones:", e); }
-    try { if (renderContacts) renderContacts(refs.bottomR, normalized.emails || [], [], { only: "emails" }); } catch (e) { console.error("[UI] emails:", e); }
+    try { if (renderSocial) renderSocial(refs.bottomL, normalized.socialLinks); } catch (e) { console.error("[UI] social:", e); }
+    try { if (renderLinks) renderLinks(refs.bottomR, normalized.bestLinks); } catch (e) { console.error("[UI] links:", e); }
 
     try {
-      if (actions && typeof renderActions === "function") {
-        renderActions(actions, {
-          onCSV: handleCsvExport,
-          onExcel: handleExcelExport,
-          footerNote: footerNote || (accessState.isPremium ? "Plan Premium activo." : `Plan Gratis: ${accessState.usageLabel} descargas usadas.`)
-        });
-      }
+      if (actions) actions.innerHTML = "";
     } catch (e) { console.error("[UI] actions:", e); }
+
+    refreshPlanUi();
 
     return normalized;
   }
@@ -1007,12 +1178,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       CURRENT_ISO = newISO;
       CURRENT_CC  = ccFromISO(newISO);
 
-      // Limpiar store y grid para no mezclar resultados de banderas distintas
-      saveStore({});
-      updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
-      resetGrid(root, refs);
+      renderHeaderUi();
 
-      // Re-extraer SOLO para la nueva bandera
+      updateHeaderStats(headerMount, aggregateStatsFromStore(loadStore()));
+      const activeUrl = await getActiveTabUrl();
+      const cached = getStoredRecordByUrlForCountry(activeUrl, CURRENT_ISO);
+      if (cached && (cached.record?.emails?.length || cached.record?.phones?.length || cached.record?.h1 || cached.record?.technology)) {
+        await renderDataToUi(cached.record, cached.url, `Mostrando el progreso guardado para ${countryLabelFromISO(CURRENT_ISO)}.`);
+        updateHeaderStats(headerMount, aggregateStatsFromStore(loadStore()));
+        renderHeaderUi();
+        return;
+      }
+
+      resetGrid(root, refs);
+      lastQueryLabel = "";
       await extractAndRender({ deepScan: false, forceRefresh: true });
     } catch(e){
       console.error("onCountryChanged:", e);
@@ -1030,41 +1209,23 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!rows.length) {
         const last = await getLastExport();
         if (!last.length) { toast(alerts, "info", "No hay datos para exportar."); return; }
-        const allowed = await syncAccessState();
-        if (!canDownload(allowed.freeDownloadsUsed, allowed.plan)) {
-          await openPremiumUpsell({ source: "excel-export", reason: "downloads-limit" });
-          return;
-        }
-        const usage = await registerDownload();
-        if (!usage.allowed) {
-          await syncAccessState();
-          await openPremiumUpsell({ source: "excel-export", reason: "downloads-limit" });
-          return;
-        }
+        const usage = await authorizeExport("excel", last.length);
+        if (!usage) return;
         exportToExcel(last, "datos.xlsx");
-        await syncAccessState();
         toast(alerts, "success", "Descargando la última exportación.");
         return;
       }
-      const allowed = await syncAccessState();
-      if (!canDownload(allowed.freeDownloadsUsed, allowed.plan)) {
-        await openPremiumUpsell({ source: "excel-export", reason: "downloads-limit" });
-        return;
-      }
-      const usage = await registerDownload();
-      if (!usage.allowed) {
-        await syncAccessState();
-        await openPremiumUpsell({ source: "excel-export", reason: "downloads-limit" });
-        return;
-      }
+      const usage = await authorizeExport("excel", rows.length);
+      if (!usage) return;
       exportToExcel(rows, "datos.xlsx");
       await cacheLastExport(rows);
-      await syncAccessState();
 
       saveStore({});
       updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
       resetGrid(root, refs);
-      toast(alerts, "success", "Exportado. Datos limpiados.");
+      lastQueryLabel = "";
+      renderHeaderUi();
+      toast(alerts, "success", "Exportado. El progreso guardado se limpió.");
     } catch (e) { console.error("[Export Excel]", e); }
   };
 
@@ -1076,52 +1237,53 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!rows.length) {
         const last = await getLastExport();
         if (!last.length) { toast(alerts, "info", "No hay datos para exportar."); return; }
-        const allowed = await syncAccessState();
-        if (!canDownload(allowed.freeDownloadsUsed, allowed.plan)) {
-          await openPremiumUpsell({ source: "csv-export", reason: "downloads-limit" });
-          return;
-        }
-        const usage = await registerDownload();
-        if (!usage.allowed) {
-          await syncAccessState();
-          await openPremiumUpsell({ source: "csv-export", reason: "downloads-limit" });
-          return;
-        }
+        const usage = await authorizeExport("csv", last.length);
+        if (!usage) return;
         exportToCSV(last, "datos.csv");
-        await syncAccessState();
         toast(alerts, "success", "Descargando la última exportación.");
         return;
       }
-      const allowed = await syncAccessState();
-      if (!canDownload(allowed.freeDownloadsUsed, allowed.plan)) {
-        await openPremiumUpsell({ source: "csv-export", reason: "downloads-limit" });
-        return;
-      }
-      const usage = await registerDownload();
-      if (!usage.allowed) {
-        await syncAccessState();
-        await openPremiumUpsell({ source: "csv-export", reason: "downloads-limit" });
-        return;
-      }
+      const usage = await authorizeExport("csv", rows.length);
+      if (!usage) return;
       exportToCSV(rows, "datos.csv");
       await cacheLastExport(rows);
-      await syncAccessState();
 
       saveStore({});
       updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
       resetGrid(root, refs);
-      toast(alerts, "success", "Exportado. Datos limpiados.");
+      lastQueryLabel = "";
+      renderHeaderUi();
+      toast(alerts, "success", "Exportado. El progreso guardado se limpió.");
     } catch (e) { console.error("[Export CSV]", e); }
   };
 
-  renderHeader(headerMount, {
-    country: CURRENT_ISO,
-    stats: aggregateStatsFromStore(loadStore()),
+  handleJsonExport = async () => {
+    try {
+      let rows = rowsFromStore(loadStore());
+      if (!rows.length) {
+        const last = await getLastExport();
+        if (!last.length) { toast(alerts, "info", "No hay datos para exportar."); return; }
+        const usage = await authorizeExport("json", last.length);
+        if (!usage) return;
+        exportToJSON(last, "datos.json");
+        toast(alerts, "success", "Descargando la última exportación.");
+        return;
+      }
+      const usage = await authorizeExport("json", rows.length);
+      if (!usage) return;
+      exportToJSON(rows, "datos.json");
+      await cacheLastExport(rows);
 
-    onCountryChange: onCountryChanged,
-    onExcel: handleExcelExport,
-    onCSV: handleCsvExport,
-  });
+      saveStore({});
+      updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
+      resetGrid(root, refs);
+      lastQueryLabel = "";
+      renderHeaderUi();
+      toast(alerts, "success", "Exportado. El progreso guardado se limpió.");
+    } catch (e) { console.error("[Export JSON]", e); }
+  };
+
+  renderHeaderUi();
 
   try {
     if (typeof renderRemoteScanUi === "function") {
@@ -1142,7 +1304,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const state = await syncAccessState();
       const requestedDeep = (typeof deepScan === "boolean") ? deepScan : deepScanEnabled;
       const activeUrl = await getActiveTabUrl();
-      const cached = getStoredRecordByUrl(activeUrl);
+      const cached = getStoredRecordByUrlForCountry(activeUrl, CURRENT_ISO);
       const deepScanState = activeUrl
         ? await wasUrlAlreadyDeepScanned(activeUrl, CURRENT_ISO)
         : { cached: false, shallowVisited: false, meta: null };
@@ -1163,6 +1325,7 @@ document.addEventListener("DOMContentLoaded", async () => {
             : undefined
         );
         updateHeaderStats(headerMount, aggregateStatsFromStore(loadStore()));
+        renderHeaderUi();
         if (alreadyDeepScanned && requestedDeep) {
           return;
         }
@@ -1181,10 +1344,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       try {
         const meta  = computeKey(url, data.technology);
         const store = loadStore();
-        finalRecord = mergeRecord(store[meta.key], url, data, meta);
+        finalRecord = mergeRecord(store[meta.key], url, data, meta, CURRENT_ISO);
         store[meta.key] = finalRecord;
         saveStore(store);
         updateHeaderStats(headerMount, aggregateStatsFromStore(store));
+        renderHeaderUi();
       } catch (e) { console.error("[Store] merge/save:", e); }
       await markDeepScanMeta(url, {
         country: CURRENT_ISO,

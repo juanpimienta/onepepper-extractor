@@ -12,6 +12,13 @@ export const BILLING_CONFIG = {
     statusUrl: "https://onepepper-licensing.onrender.com/api/license/status",
     bearerToken: "onepepper_license_api_2026",
     timeoutMs: 8000
+  },
+  accessApi: {
+    statusUrl: "https://onepepper-licensing.onrender.com/api/access/status",
+    checkUrl: "https://onepepper-licensing.onrender.com/api/access/export/check",
+    commitUrl: "https://onepepper-licensing.onrender.com/api/access/export/commit",
+    bearerToken: "onepepper_license_api_2026",
+    timeoutMs: 8000
   }
 };
 
@@ -40,6 +47,13 @@ export function buildCheckoutUrl(rawPlan, context = {}) {
 export function buildLicenseStatusUrl(installId = "") {
   if (!BILLING_CONFIG.licenseApi.statusUrl) return "";
   const url = new URL(BILLING_CONFIG.licenseApi.statusUrl);
+  if (installId) url.searchParams.set("installId", installId);
+  return url.toString();
+}
+
+export function buildAccessStatusUrl(installId = "") {
+  if (!BILLING_CONFIG.accessApi.statusUrl) return "";
+  const url = new URL(BILLING_CONFIG.accessApi.statusUrl);
   if (installId) url.searchParams.set("installId", installId);
   return url.toString();
 }

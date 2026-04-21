@@ -12,6 +12,7 @@ const APP_CANCEL_URL = process.env.APP_CANCEL_URL || `${APP_BASE_URL}/billing/ca
 const LICENSES_FILE = path.join(process.cwd(), "data", "licenses.json");
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const FREE_EXPORTS_LIMIT = Number(process.env.FREE_EXPORTS_LIMIT || 10);
 const PRICE_BY_PLAN = {
   month: String(process.env.STRIPE_PRICE_MONTHLY_ID || "").trim(),
   year: String(process.env.STRIPE_PRICE_YEARLY_ID || "").trim()
@@ -25,14 +26,18 @@ async function ensureStore() {
   try {
     await fs.access(LICENSES_FILE);
   } catch {
-    await fs.writeFile(LICENSES_FILE, JSON.stringify({ licenses: {} }, null, 2), "utf8");
+    await fs.writeFile(LICENSES_FILE, JSON.stringify({ licenses: {}, access: {} }, null, 2), "utf8");
   }
 }
 
 async function readStore() {
   await ensureStore();
   const raw = await fs.readFile(LICENSES_FILE, "utf8");
-  return JSON.parse(raw || '{"licenses":{}}');
+  const parsed = JSON.parse(raw || '{"licenses":{},"access":{}}');
+  return {
+    licenses: parsed.licenses || {},
+    access: parsed.access || {}
+  };
 }
 
 async function writeStore(store) {
@@ -103,6 +108,60 @@ function upsertLicense(store, installId) {
     ...(store.licenses[key] || {})
   };
   return store.licenses[key];
+}
+
+function isPremiumInstall(store, installId = "") {
+  const key = String(installId || "").trim();
+  const license = key ? store.licenses[key] : null;
+  return !!license?.premium;
+}
+
+function upsertAccess(store, installId) {
+  const key = String(installId || "").trim();
+  if (!key) return null;
+  if (!store.access) store.access = {};
+
+  const current = store.access[key] || {};
+  const exportsUsed = Number(current.exportsUsed || 0);
+
+  store.access[key] = {
+    installId: key,
+    exportsUsed: Number.isFinite(exportsUsed) && exportsUsed > 0 ? Math.floor(exportsUsed) : 0,
+    exportsLimit: FREE_EXPORTS_LIMIT,
+    createdAt: current.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastExportAt: current.lastExportAt || "",
+    lastExportFormat: current.lastExportFormat || "",
+    lastCountry: current.lastCountry || "",
+    lastDomain: current.lastDomain || "",
+    ...(current || {})
+  };
+
+  return store.access[key];
+}
+
+function buildAccessPayload(store, installId = "") {
+  const key = String(installId || "").trim();
+  const premium = isPremiumInstall(store, key);
+  const access = upsertAccess(store, key);
+  const exportsUsed = Number(access?.exportsUsed || 0);
+  const exportsLimit = FREE_EXPORTS_LIMIT;
+  const exportsRemaining = premium ? null : Math.max(0, exportsLimit - exportsUsed);
+
+  return {
+    installId: key,
+    plan: premium ? "premium" : "free",
+    isPremium: premium,
+    exportsUsed,
+    exportsLimit,
+    exportsRemaining,
+    canExport: premium ? true : exportsUsed < exportsLimit,
+    usageLabel: premium ? "Ilimitado" : `${exportsUsed}/${exportsLimit}`,
+    lastExportAt: access?.lastExportAt || "",
+    lastExportFormat: access?.lastExportFormat || "",
+    lastCountry: access?.lastCountry || "",
+    lastDomain: access?.lastDomain || ""
+  };
 }
 
 function applyCheckoutSessionToLicense(license, session = {}) {
@@ -383,6 +442,79 @@ app.get("/api/license/status", auth, async (req, res) => {
     expiresAt: license.currentPeriodEnd || license.cancelAt || "",
     customerPortalUrl: license.customerPortalUrl || "",
     provider: "stripe"
+  });
+});
+
+app.get("/api/access/status", auth, async (req, res) => {
+  const installId = String(req.query.installId || "").trim();
+  if (!installId) {
+    return res.status(400).json({ message: "installId es obligatorio" });
+  }
+
+  const store = await readStore();
+  const payload = buildAccessPayload(store, installId);
+  await writeStore(store);
+  return res.json(payload);
+});
+
+app.post("/api/access/export/check", auth, async (req, res) => {
+  const installId = String(req.body?.installId || "").trim();
+  if (!installId) {
+    return res.status(400).json({ message: "installId es obligatorio" });
+  }
+
+  const store = await readStore();
+  const payload = buildAccessPayload(store, installId);
+  await writeStore(store);
+
+  return res.json({
+    ok: true,
+    allowed: payload.canExport,
+    reason: payload.canExport ? "" : "downloads_limit",
+    ...payload
+  });
+});
+
+app.post("/api/access/export/commit", auth, async (req, res) => {
+  const installId = String(req.body?.installId || "").trim();
+  if (!installId) {
+    return res.status(400).json({ message: "installId es obligatorio" });
+  }
+
+  const store = await readStore();
+  const access = upsertAccess(store, installId);
+  const premium = isPremiumInstall(store, installId);
+  const current = buildAccessPayload(store, installId);
+
+  if (!current.canExport) {
+    await writeStore(store);
+    return res.status(403).json({
+      message: "Has alcanzado el límite del plan gratuito.",
+      allowed: false,
+      reason: "downloads_limit",
+      ...current
+    });
+  }
+
+  const nowIso = new Date().toISOString();
+  access.updatedAt = nowIso;
+  access.lastExportAt = nowIso;
+  access.lastExportFormat = String(req.body?.format || "").trim().toLowerCase();
+  access.lastCountry = String(req.body?.country || "").trim().toUpperCase();
+  access.lastDomain = String(req.body?.domain || "").trim();
+
+  if (!premium) {
+    access.exportsUsed = Number(access.exportsUsed || 0) + 1;
+  }
+
+  const next = buildAccessPayload(store, installId);
+  await writeStore(store);
+
+  return res.json({
+    ok: true,
+    allowed: true,
+    reason: "",
+    ...next
   });
 });
 
