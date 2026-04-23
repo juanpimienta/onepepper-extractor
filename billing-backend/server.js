@@ -31,7 +31,7 @@ function normalizeEmail(email = "") {
 }
 
 function isValidEmail(email = "") {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(email));
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(normalizeEmail(email));
 }
 
 async function ensureStore() {
@@ -422,6 +422,12 @@ app.get("/api/license/status", auth, async (req, res) => {
 
   const store = await readStore();
   const license = store.licenses[installId];
+  const manualEmailMismatch = !!(
+    license?.premium
+    && license?.provider === "manual_email"
+    && email
+    && normalizeEmail(license.userEmail || "") !== email
+  );
 
   if (email && ADMIN_PREMIUM_EMAILS.has(email)) {
     const manual = upsertLicense(store, installId);
@@ -444,7 +450,7 @@ app.get("/api/license/status", auth, async (req, res) => {
     });
   }
 
-  if (license?.premium) {
+  if (license?.premium && !manualEmailMismatch) {
     return res.json({
       premium: true,
       plan: "premium",
@@ -493,6 +499,17 @@ app.get("/api/license/status", auth, async (req, res) => {
       customerPortalUrl: linked.customerPortalUrl || "",
       provider: "stripe",
       source: "stripe_email",
+      email
+    });
+  }
+
+  if (manualEmailMismatch) {
+    return res.json({
+      premium: false,
+      plan: "free",
+      status: "inactive",
+      provider: "manual_email",
+      source: "manual_email_mismatch",
       email
     });
   }
