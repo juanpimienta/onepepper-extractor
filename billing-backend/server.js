@@ -12,31 +12,43 @@ const APP_CANCEL_URL = process.env.APP_CANCEL_URL || `${APP_BASE_URL}/billing/ca
 const LICENSES_FILE = path.join(process.cwd(), "data", "licenses.json");
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-const FREE_EXPORTS_LIMIT = Number(process.env.FREE_EXPORTS_LIMIT || 10);
 const PRICE_BY_PLAN = {
   month: String(process.env.STRIPE_PRICE_MONTHLY_ID || "").trim(),
   year: String(process.env.STRIPE_PRICE_YEARLY_ID || "").trim()
 };
+const ADMIN_PREMIUM_EMAILS = new Set(
+  String(process.env.ADMIN_PREMIUM_EMAILS || "")
+    .split(",")
+    .map((email) => normalizeEmail(email))
+    .filter(Boolean)
+);
 const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2026-02-25.clover" })
   : null;
+
+function normalizeEmail(email = "") {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidEmail(email = "") {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(email));
+}
 
 async function ensureStore() {
   await fs.mkdir(path.dirname(LICENSES_FILE), { recursive: true });
   try {
     await fs.access(LICENSES_FILE);
   } catch {
-    await fs.writeFile(LICENSES_FILE, JSON.stringify({ licenses: {}, access: {} }, null, 2), "utf8");
+    await fs.writeFile(LICENSES_FILE, JSON.stringify({ licenses: {} }, null, 2), "utf8");
   }
 }
 
 async function readStore() {
   await ensureStore();
   const raw = await fs.readFile(LICENSES_FILE, "utf8");
-  const parsed = JSON.parse(raw || '{"licenses":{},"access":{}}');
+  const parsed = JSON.parse(raw || '{"licenses":{}}');
   return {
-    licenses: parsed.licenses || {},
-    access: parsed.access || {}
+    licenses: parsed.licenses || {}
   };
 }
 
@@ -89,6 +101,12 @@ function findLicenseByCustomerId(store, customerId = "") {
   return Object.values(store.licenses).find((license) => String(license.customerId || "") === target) || null;
 }
 
+function findLicenseByEmail(store, email = "") {
+  const target = normalizeEmail(email);
+  if (!target) return null;
+  return Object.values(store.licenses).find((license) => normalizeEmail(license.userEmail || "") === target) || null;
+}
+
 function findLicenseByCheckoutSessionId(store, checkoutSessionId = "") {
   const target = String(checkoutSessionId || "").trim();
   if (!target) return null;
@@ -108,60 +126,6 @@ function upsertLicense(store, installId) {
     ...(store.licenses[key] || {})
   };
   return store.licenses[key];
-}
-
-function isPremiumInstall(store, installId = "") {
-  const key = String(installId || "").trim();
-  const license = key ? store.licenses[key] : null;
-  return !!license?.premium;
-}
-
-function upsertAccess(store, installId) {
-  const key = String(installId || "").trim();
-  if (!key) return null;
-  if (!store.access) store.access = {};
-
-  const current = store.access[key] || {};
-  const exportsUsed = Number(current.exportsUsed || 0);
-
-  store.access[key] = {
-    installId: key,
-    exportsUsed: Number.isFinite(exportsUsed) && exportsUsed > 0 ? Math.floor(exportsUsed) : 0,
-    exportsLimit: FREE_EXPORTS_LIMIT,
-    createdAt: current.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    lastExportAt: current.lastExportAt || "",
-    lastExportFormat: current.lastExportFormat || "",
-    lastCountry: current.lastCountry || "",
-    lastDomain: current.lastDomain || "",
-    ...(current || {})
-  };
-
-  return store.access[key];
-}
-
-function buildAccessPayload(store, installId = "") {
-  const key = String(installId || "").trim();
-  const premium = isPremiumInstall(store, key);
-  const access = upsertAccess(store, key);
-  const exportsUsed = Number(access?.exportsUsed || 0);
-  const exportsLimit = FREE_EXPORTS_LIMIT;
-  const exportsRemaining = premium ? null : Math.max(0, exportsLimit - exportsUsed);
-
-  return {
-    installId: key,
-    plan: premium ? "premium" : "free",
-    isPremium: premium,
-    exportsUsed,
-    exportsLimit,
-    exportsRemaining,
-    canExport: premium ? true : exportsUsed < exportsLimit,
-    usageLabel: premium ? "Ilimitado" : `${exportsUsed}/${exportsLimit}`,
-    lastExportAt: access?.lastExportAt || "",
-    lastExportFormat: access?.lastExportFormat || "",
-    lastCountry: access?.lastCountry || "",
-    lastDomain: access?.lastDomain || ""
-  };
 }
 
 function applyCheckoutSessionToLicense(license, session = {}) {
@@ -266,6 +230,28 @@ async function fetchSubscription(subscriptionId) {
   } catch {
     return null;
   }
+}
+
+async function findActiveStripeSubscriptionByEmail(email = "") {
+  const normalized = normalizeEmail(email);
+  if (!stripe || !isValidEmail(normalized)) return null;
+
+  try {
+    const customers = await stripe.customers.list({ email: normalized, limit: 10 });
+    for (const customer of customers.data || []) {
+      const subscriptions = await stripe.subscriptions.list({
+        customer: customer.id,
+        status: "all",
+        limit: 10
+      });
+      const active = (subscriptions.data || []).find((subscription) => isPremiumStatus(subscription.status));
+      if (active) {
+        return { customer, subscription: active };
+      }
+    }
+  } catch {}
+
+  return null;
 }
 
 async function fetchChargeForRefund(refund = {}) {
@@ -374,6 +360,7 @@ app.get("/health", (_req, res) => {
 app.get("/api/stripe/checkout", async (req, res) => {
   const plan = resolvePlan(req.query.plan || "month");
   const installId = String(req.query.installId || "").trim();
+  const email = normalizeEmail(req.query.email || "");
   const source = String(req.query.source || "extension").trim();
   const priceId = getPriceId(plan);
 
@@ -397,8 +384,10 @@ app.get("/api/stripe/checkout", async (req, res) => {
       allow_promotion_codes: true,
       billing_address_collection: "auto",
       locale: "es",
+      ...(isValidEmail(email) ? { customer_email: email } : {}),
       metadata: {
         installId,
+        userEmail: email,
         source,
         plan,
         platform: "chrome_extension"
@@ -406,6 +395,7 @@ app.get("/api/stripe/checkout", async (req, res) => {
       subscription_data: {
         metadata: {
           installId,
+          userEmail: email,
           source,
           plan,
           platform: "chrome_extension"
@@ -425,14 +415,90 @@ app.get("/api/stripe/checkout", async (req, res) => {
 
 app.get("/api/license/status", auth, async (req, res) => {
   const installId = String(req.query.installId || "").trim();
+  const email = normalizeEmail(req.query.email || "");
   if (!installId) {
     return res.status(400).json({ message: "installId es obligatorio" });
   }
 
   const store = await readStore();
   const license = store.licenses[installId];
+
+  if (email && ADMIN_PREMIUM_EMAILS.has(email)) {
+    const manual = upsertLicense(store, installId);
+    manual.provider = "manual_email";
+    manual.userEmail = email;
+    manual.plan = "premium";
+    manual.premium = true;
+    manual.status = "active";
+    manual.updatedAt = new Date().toISOString();
+    await writeStore(store);
+    return res.json({
+      premium: true,
+      plan: "premium",
+      status: "active",
+      expiresAt: "",
+      customerPortalUrl: "",
+      provider: "manual_email",
+      source: "manual_email",
+      email
+    });
+  }
+
+  if (license?.premium) {
+    return res.json({
+      premium: true,
+      plan: "premium",
+      status: license.status || "active",
+      expiresAt: license.currentPeriodEnd || license.cancelAt || "",
+      customerPortalUrl: license.customerPortalUrl || "",
+      provider: license.provider || "stripe",
+      email: license.userEmail || email || ""
+    });
+  }
+
+  const emailLicense = email ? findLicenseByEmail(store, email) : null;
+  if (emailLicense?.premium) {
+    const linked = upsertLicense(store, installId);
+    Object.assign(linked, {
+      ...emailLicense,
+      installId,
+      linkedFromEmail: email,
+      updatedAt: new Date().toISOString()
+    });
+    await writeStore(store);
+    return res.json({
+      premium: true,
+      plan: "premium",
+      status: emailLicense.status || "active",
+      expiresAt: emailLicense.currentPeriodEnd || emailLicense.cancelAt || "",
+      customerPortalUrl: emailLicense.customerPortalUrl || "",
+      provider: emailLicense.provider || "stripe",
+      source: "stored_email",
+      email
+    });
+  }
+
+  const activeByStripeEmail = email ? await findActiveStripeSubscriptionByEmail(email) : null;
+  if (activeByStripeEmail) {
+    const linked = upsertLicense(store, installId);
+    linked.userEmail = email;
+    linked.customerId = activeByStripeEmail.customer.id;
+    applySubscriptionToLicense(linked, activeByStripeEmail.subscription);
+    await writeStore(store);
+    return res.json({
+      premium: true,
+      plan: "premium",
+      status: linked.status || "active",
+      expiresAt: linked.currentPeriodEnd || linked.cancelAt || "",
+      customerPortalUrl: linked.customerPortalUrl || "",
+      provider: "stripe",
+      source: "stripe_email",
+      email
+    });
+  }
+
   if (!license) {
-    return res.json({ premium: false, plan: "free", status: "inactive", provider: "stripe" });
+    return res.json({ premium: false, plan: "free", status: "inactive", provider: "stripe", email });
   }
 
   return res.json({
@@ -442,79 +508,6 @@ app.get("/api/license/status", auth, async (req, res) => {
     expiresAt: license.currentPeriodEnd || license.cancelAt || "",
     customerPortalUrl: license.customerPortalUrl || "",
     provider: "stripe"
-  });
-});
-
-app.get("/api/access/status", auth, async (req, res) => {
-  const installId = String(req.query.installId || "").trim();
-  if (!installId) {
-    return res.status(400).json({ message: "installId es obligatorio" });
-  }
-
-  const store = await readStore();
-  const payload = buildAccessPayload(store, installId);
-  await writeStore(store);
-  return res.json(payload);
-});
-
-app.post("/api/access/export/check", auth, async (req, res) => {
-  const installId = String(req.body?.installId || "").trim();
-  if (!installId) {
-    return res.status(400).json({ message: "installId es obligatorio" });
-  }
-
-  const store = await readStore();
-  const payload = buildAccessPayload(store, installId);
-  await writeStore(store);
-
-  return res.json({
-    ok: true,
-    allowed: payload.canExport,
-    reason: payload.canExport ? "" : "downloads_limit",
-    ...payload
-  });
-});
-
-app.post("/api/access/export/commit", auth, async (req, res) => {
-  const installId = String(req.body?.installId || "").trim();
-  if (!installId) {
-    return res.status(400).json({ message: "installId es obligatorio" });
-  }
-
-  const store = await readStore();
-  const access = upsertAccess(store, installId);
-  const premium = isPremiumInstall(store, installId);
-  const current = buildAccessPayload(store, installId);
-
-  if (!current.canExport) {
-    await writeStore(store);
-    return res.status(403).json({
-      message: "Has alcanzado el límite del plan gratuito.",
-      allowed: false,
-      reason: "downloads_limit",
-      ...current
-    });
-  }
-
-  const nowIso = new Date().toISOString();
-  access.updatedAt = nowIso;
-  access.lastExportAt = nowIso;
-  access.lastExportFormat = String(req.body?.format || "").trim().toLowerCase();
-  access.lastCountry = String(req.body?.country || "").trim().toUpperCase();
-  access.lastDomain = String(req.body?.domain || "").trim();
-
-  if (!premium) {
-    access.exportsUsed = Number(access.exportsUsed || 0) + 1;
-  }
-
-  const next = buildAccessPayload(store, installId);
-  await writeStore(store);
-
-  return res.json({
-    ok: true,
-    allowed: true,
-    reason: "",
-    ...next
   });
 });
 
