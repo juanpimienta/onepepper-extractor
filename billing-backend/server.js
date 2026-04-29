@@ -422,11 +422,12 @@ app.get("/api/license/status", auth, async (req, res) => {
 
   const store = await readStore();
   const license = store.licenses[installId];
-  const manualEmailMismatch = !!(
+  const storedLicenseEmail = normalizeEmail(license?.userEmail || "");
+  const strictLicenseEmailMismatch = !!(
     license?.premium
-    && license?.provider === "manual_email"
     && email
-    && normalizeEmail(license.userEmail || "") !== email
+    && storedLicenseEmail
+    && storedLicenseEmail !== email
   );
 
   if (email && ADMIN_PREMIUM_EMAILS.has(email)) {
@@ -447,18 +448,6 @@ app.get("/api/license/status", auth, async (req, res) => {
       provider: "manual_email",
       source: "manual_email",
       email
-    });
-  }
-
-  if (license?.premium && !manualEmailMismatch) {
-    return res.json({
-      premium: true,
-      plan: "premium",
-      status: license.status || "active",
-      expiresAt: license.currentPeriodEnd || license.cancelAt || "",
-      customerPortalUrl: license.customerPortalUrl || "",
-      provider: license.provider || "stripe",
-      email: license.userEmail || email || ""
     });
   }
 
@@ -484,6 +473,29 @@ app.get("/api/license/status", auth, async (req, res) => {
     });
   }
 
+  if (strictLicenseEmailMismatch) {
+    return res.json({
+      premium: false,
+      plan: "free",
+      status: "inactive",
+      provider: license?.provider || "stripe",
+      source: "email_mismatch",
+      email
+    });
+  }
+
+  if (license?.premium) {
+    return res.json({
+      premium: true,
+      plan: "premium",
+      status: license.status || "active",
+      expiresAt: license.currentPeriodEnd || license.cancelAt || "",
+      customerPortalUrl: license.customerPortalUrl || "",
+      provider: license.provider || "stripe",
+      email: license.userEmail || email || ""
+    });
+  }
+
   const activeByStripeEmail = email ? await findActiveStripeSubscriptionByEmail(email) : null;
   if (activeByStripeEmail) {
     const linked = upsertLicense(store, installId);
@@ -499,17 +511,6 @@ app.get("/api/license/status", auth, async (req, res) => {
       customerPortalUrl: linked.customerPortalUrl || "",
       provider: "stripe",
       source: "stripe_email",
-      email
-    });
-  }
-
-  if (manualEmailMismatch) {
-    return res.json({
-      premium: false,
-      plan: "free",
-      status: "inactive",
-      provider: "manual_email",
-      source: "manual_email_mismatch",
       email
     });
   }
