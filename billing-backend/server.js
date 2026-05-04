@@ -422,6 +422,7 @@ app.get("/api/license/status", auth, async (req, res) => {
 
   const store = await readStore();
   const license = store.licenses[installId];
+  const emailLicense = email ? findLicenseByEmail(store, email) : null;
   const storedLicenseEmail = normalizeEmail(license?.userEmail || "");
   const strictLicenseEmailMismatch = !!(
     license?.premium
@@ -429,6 +430,27 @@ app.get("/api/license/status", auth, async (req, res) => {
     && storedLicenseEmail
     && storedLicenseEmail !== email
   );
+  const emailLinkedToDifferentInstall = !!(
+    emailLicense?.premium
+    && String(emailLicense.installId || "").trim()
+    && String(emailLicense.installId || "").trim() !== installId
+  );
+
+  if (emailLinkedToDifferentInstall) {
+    const provider = emailLicense.provider || "stripe";
+    const isManual = provider === "manual_email";
+    return res.json({
+      premium: false,
+      plan: "free",
+      status: "inactive",
+      provider,
+      source: isManual ? "manual_email_in_use" : "premium_email_in_use",
+      email,
+      message: isManual
+        ? "Este correo manual ya está activo en otra instalación."
+        : "Este correo Premium ya está activo en otra instalación."
+    });
+  }
 
   if (email && ADMIN_PREMIUM_EMAILS.has(email)) {
     const manual = upsertLicense(store, installId);
@@ -451,7 +473,6 @@ app.get("/api/license/status", auth, async (req, res) => {
     });
   }
 
-  const emailLicense = email ? findLicenseByEmail(store, email) : null;
   if (emailLicense?.premium) {
     const linked = upsertLicense(store, installId);
     Object.assign(linked, {
