@@ -128,6 +128,39 @@ function upsertLicense(store, installId) {
   return store.licenses[key];
 }
 
+function transferLicenseToInstall(store, sourceLicense, targetInstallId, email = "") {
+  if (!store || !sourceLicense || !targetInstallId) return null;
+  const normalizedEmail = normalizeEmail(email || sourceLicense.userEmail || "");
+  const sourceInstallId = String(sourceLicense.installId || "").trim();
+  const target = upsertLicense(store, targetInstallId);
+  if (!target) return null;
+
+  Object.assign(target, {
+    ...sourceLicense,
+    installId: targetInstallId,
+    userEmail: normalizedEmail || sourceLicense.userEmail || "",
+    linkedFromEmail: normalizedEmail || sourceLicense.userEmail || "",
+    updatedAt: new Date().toISOString()
+  });
+
+  if (sourceInstallId && sourceInstallId !== targetInstallId && store.licenses[sourceInstallId]) {
+    store.licenses[sourceInstallId] = {
+      ...store.licenses[sourceInstallId],
+      premium: false,
+      plan: "free",
+      status: "transferred",
+      userEmail: "",
+      currentPeriodEnd: "",
+      cancelAt: "",
+      cancelAtPeriodEnd: false,
+      linkedFromEmail: "",
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  return target;
+}
+
 function applyCheckoutSessionToLicense(license, session = {}) {
   if (!license) return;
   const metadata = session.metadata || {};
@@ -416,6 +449,7 @@ app.get("/api/stripe/checkout", async (req, res) => {
 app.get("/api/license/status", auth, async (req, res) => {
   const installId = String(req.query.installId || "").trim();
   const email = normalizeEmail(req.query.email || "");
+  const takeover = String(req.query.takeover || "").trim() === "1";
   if (!installId) {
     return res.status(400).json({ message: "installId es obligatorio" });
   }
@@ -439,6 +473,23 @@ app.get("/api/license/status", auth, async (req, res) => {
   if (emailLinkedToDifferentInstall) {
     const provider = emailLicense.provider || "stripe";
     const isManual = provider === "manual_email";
+    if (takeover) {
+      const transferred = transferLicenseToInstall(store, emailLicense, installId, email);
+      await writeStore(store);
+      return res.json({
+        premium: true,
+        plan: "premium",
+        status: transferred?.status || "active",
+        expiresAt: transferred?.currentPeriodEnd || transferred?.cancelAt || "",
+        customerPortalUrl: transferred?.customerPortalUrl || "",
+        provider,
+        source: isManual ? "manual_email_transferred" : "premium_email_transferred",
+        email,
+        message: isManual
+          ? "El acceso manual se movió a esta instalación."
+          : "El acceso Premium se movió a esta instalación."
+      });
+    }
     return res.json({
       premium: false,
       plan: "free",
@@ -446,6 +497,7 @@ app.get("/api/license/status", auth, async (req, res) => {
       provider,
       source: isManual ? "manual_email_in_use" : "premium_email_in_use",
       email,
+      takeoverAvailable: true,
       message: isManual
         ? "Este correo manual ya está activo en otra instalación."
         : "Este correo Premium ya está activo en otra instalación."

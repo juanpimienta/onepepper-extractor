@@ -11,14 +11,7 @@ export const BILLING_CONFIG = {
     // Endpoint que devuelve el estado premium para un installId.
     statusUrl: "https://onepepper-licensing.onrender.com/api/license/status",
     bearerToken: "onepepper_license_api_2026",
-    timeoutMs: 8000
-  },
-  accessApi: {
-    statusUrl: "https://onepepper-licensing.onrender.com/api/access/status",
-    checkUrl: "https://onepepper-licensing.onrender.com/api/access/export/check",
-    commitUrl: "https://onepepper-licensing.onrender.com/api/access/export/commit",
-    bearerToken: "onepepper_license_api_2026",
-    timeoutMs: 8000
+    timeoutMs: 2500
   }
 };
 
@@ -31,12 +24,13 @@ export function resolveBillingPlan(rawPlan = "month") {
 
 export function buildCheckoutUrl(rawPlan, context = {}) {
   const plan = resolveBillingPlan(rawPlan);
-  const { installId = "", source = "popup" } = context;
+  const { installId = "", source = "popup", email = "" } = context;
 
   if (BILLING_CONFIG.stripe.checkoutBaseUrl) {
     const url = new URL(BILLING_CONFIG.stripe.checkoutBaseUrl);
     url.searchParams.set("plan", plan);
     if (installId) url.searchParams.set("installId", installId);
+    if (email) url.searchParams.set("email", email);
     if (source) url.searchParams.set("source", source);
     url.searchParams.set("platform", "chrome_extension");
     return url.toString();
@@ -44,16 +38,14 @@ export function buildCheckoutUrl(rawPlan, context = {}) {
   return "";
 }
 
-export function buildLicenseStatusUrl(installId = "") {
+export function buildLicenseStatusUrl(context = "") {
   if (!BILLING_CONFIG.licenseApi.statusUrl) return "";
+  const installId = typeof context === "string" ? context : (context.installId || "");
+  const email = typeof context === "string" ? "" : (context.email || "");
+  const takeover = typeof context === "string" ? false : !!context.takeover;
   const url = new URL(BILLING_CONFIG.licenseApi.statusUrl);
   if (installId) url.searchParams.set("installId", installId);
-  return url.toString();
-}
-
-export function buildAccessStatusUrl(installId = "") {
-  if (!BILLING_CONFIG.accessApi.statusUrl) return "";
-  const url = new URL(BILLING_CONFIG.accessApi.statusUrl);
-  if (installId) url.searchParams.set("installId", installId);
+  if (email) url.searchParams.set("email", email);
+  if (takeover) url.searchParams.set("takeover", "1");
   return url.toString();
 }

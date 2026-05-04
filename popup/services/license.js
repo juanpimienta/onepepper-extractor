@@ -3,6 +3,12 @@ import { setUserPlan } from "./access.js";
 const INSTALL_ID_KEY = "licenseInstallId";
 const LICENSE_CACHE_KEY = "licenseCache";
 const LICENSE_LAST_SYNC_KEY = "licenseLastSyncAt";
+const PREMIUM_EMAIL_KEY = "premiumEmail";
+let latestSyncRequestId = 0;
+
+function normalizeEmail(email = "") {
+  return String(email || "").trim().toLowerCase();
+}
 
 export async function getOrCreateInstallId() {
   const stored = await chrome.storage.local.get({ [INSTALL_ID_KEY]: "" });
@@ -31,7 +37,20 @@ export async function invalidateLicenseCache() {
   });
 }
 
-export async function syncLicenseStatus({ force = false, maxAgeMs = 5 * 60 * 1000 } = {}) {
+export async function getPremiumEmail() {
+  const stored = await chrome.storage.local.get({ [PREMIUM_EMAIL_KEY]: "" });
+  return normalizeEmail(stored[PREMIUM_EMAIL_KEY]);
+}
+
+export async function setPremiumEmail(email = "") {
+  const normalized = normalizeEmail(email);
+  await chrome.storage.local.set({ [PREMIUM_EMAIL_KEY]: normalized });
+  await invalidateLicenseCache();
+  return normalized;
+}
+
+export async function syncLicenseStatus({ force = false, maxAgeMs = 5 * 60 * 1000, takeover = false } = {}) {
+  const requestId = ++latestSyncRequestId;
   const { cache, lastSyncAt } = await getCachedLicenseState();
   const now = Date.now();
 
@@ -40,9 +59,12 @@ export async function syncLicenseStatus({ force = false, maxAgeMs = 5 * 60 * 100
   }
 
   const installId = await getOrCreateInstallId();
+  const email = await getPremiumEmail();
   const res = await chrome.runtime.sendMessage({
     type: "SYNC_LICENSE_STATUS",
-    installId
+    installId,
+    email,
+    takeover
   });
 
   if (!res?.ok) return { ok: false, ...res };
@@ -52,8 +74,16 @@ export async function syncLicenseStatus({ force = false, maxAgeMs = 5 * 60 * 100
     plan: res.plan === "premium" ? "premium" : "free",
     status: res.status || "inactive",
     customerPortalUrl: res.customerPortalUrl || "",
-    expiresAt: res.expiresAt || ""
+    expiresAt: res.expiresAt || "",
+    email: res.email || email || "",
+    source: res.source || "",
+    message: res.message || "",
+    takeoverAvailable: !!res.takeoverAvailable
   };
+
+  if (requestId !== latestSyncRequestId) {
+    return { ok: true, cached: false, stale: true, ...next };
+  }
 
   await setUserPlan(next.plan);
   await chrome.storage.local.set({

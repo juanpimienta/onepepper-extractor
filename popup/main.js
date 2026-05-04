@@ -7,21 +7,29 @@ import { installPopupTypography } from "./ui/typography.js";
 import { useTwoColumnLayout } from "./ui/layout-grid.js";
 import {
   getAccessState,
+  getAmazonUsageState,
   registerDownload,
+  registerAmazonUse,
+  registerDeepScanUse,
+  registerRemoteScanUse,
   setUserPlan
 } from "./services/access.js";
-import { getCachedLicenseState, getOrCreateInstallId, invalidateLicenseCache, syncLicenseStatus } from "./services/license.js";
+import { getCachedLicenseState, getOrCreateInstallId, getPremiumEmail, invalidateLicenseCache, setPremiumEmail, syncLicenseStatus } from "./services/license.js";
 import { renderPlanStatus } from "./ui/render-plan-status.js";
 import { showInfoModal } from "./ui/modal.js";
-import { MAX_REMOTE_BATCH_URLS, parseBatchUrls, scanUrlWithExtractor } from "./services/remote-scan.js";
+import { parseBatchUrls, scanUrlWithExtractor } from "./services/remote-scan.js";
 import { detectMarketplaceFromURL } from "../content/extractors/marketplace.js";
 
 const STORE_KEY = "extractedDataByOrigin";
 const LEGACY_KEY = "extractedData";
+const STORE_BACKUP_KEY = "extractedDataBackup";
+const STORAGE_VERSION_KEY = "storageVersion";
+const STORAGE_VERSION = 1;
 const GENERIC_TECH = /no identificada|personalizada/i;
 const MARKET_HOSTS = /(amazon\.[a-z.]+|aliexpress\.[a-z.]+|ebay\.[a-z.]+|etsy\.com|mercadolibre\.[a-z.]+|facebook\.com|instagram\.com|tiktok\.com|walmart\.[a-z.]+)/i;
 const LAST_EXPORT_KEY = "lastExportRows";
 const DEEP_SCAN_META_KEY = "deepScanMetaByUrl";
+const REMOTE_SCAN_TASK_KEY = "remoteScanTask";
 const DEEP_SCAN_FRESH_MS = 1000 * 60 * 60 * 24;
 
 let CURRENT_ISO = "ES";
@@ -43,7 +51,8 @@ async function openStripeCheckout({ source = "premium-upgrade", plan = "month" }
   try {
     await invalidateLicenseCache().catch(() => {});
     const installId = await getOrCreateInstallId();
-    const res = await chrome.runtime.sendMessage({ type: "OPEN_CHECKOUT", plan, source, installId });
+    const email = await getPremiumEmail();
+    const res = await chrome.runtime.sendMessage({ type: "OPEN_CHECKOUT", plan, source, installId, email });
     if (res?.ok) return true;
 
     await showInfoModal({
@@ -63,12 +72,25 @@ async function openStripeCheckout({ source = "premium-upgrade", plan = "month" }
 }
 
 async function openPremiumUpsell({ source = "premium-feature", reason = "premium" } = {}) {
-  const title = reason === "downloads-limit"
-    ? "Has alcanzado el límite del plan gratuito"
-    : "Función disponible en Premium";
-  const message = reason === "downloads-limit"
-    ? "Ya usaste tus 10 descargas gratuitas. Puedes seguir viendo los resultados extraídos, pero para exportar más o activar exploración profunda necesitas Premium mensual 7,99 €."
-    : "La exploración profunda forma parte de Premium mensual 7,99 €. Con este plan tienes exportaciones ilimitadas y acceso completo a esta función.";
+  let title = "Función disponible en Premium";
+  let message = "La exploración profunda forma parte de Premium mensual 7,99 €. Con este plan tienes exportaciones ilimitadas y acceso completo a esta función.";
+
+  if (reason === "downloads-limit") {
+    title = "Has usado tu descarga gratuita de hoy";
+    message = "Ya usaste tu descarga gratuita de hoy. Vuelve en 24 horas o pasa a Premium mensual para exportar sin límites.";
+  } else if (reason === "deep-limit") {
+    title = "Búsqueda avanzada usada hoy";
+    message = "Ya usaste la búsqueda avanzada gratuita de hoy. Vuelve en 24 horas o pasa a Premium para usarla sin límites.";
+  } else if (reason === "remote-scan-limit") {
+    title = "Extractor masivo usado hoy";
+    message = "Ya usaste tu extracción masiva gratuita de hoy. Vuelve en 24 horas o pasa a Premium para escanear hasta 1000 URLs por ejecución.";
+  } else if (reason === "remote-scan-urls-limit") {
+    title = "Límite del extractor masivo gratis";
+    message = "En el plan gratis puedes escanear hasta 5 URLs por día. Pasa a Premium para escanear hasta 1000 URLs por ejecución.";
+  } else if (reason === "amazon-limit") {
+    title = "Límite gratis de Amazon";
+    message = "Ya usaste tus 20 análisis de Amazon de hoy. Vuelve en 24 horas o pasa a Premium para seguir sin este límite.";
+  }
 
   const wantsUpgrade = await showInfoModal({
     title,
@@ -78,6 +100,10 @@ async function openPremiumUpsell({ source = "premium-feature", reason = "premium
 
   if (!wantsUpgrade) return false;
   return openStripeCheckout({ source, plan: "month" });
+}
+
+function isAmazonTargetUrl(url = "") {
+  return detectMarketplaceFromURL(url || "") === "Amazon";
 }
 
 /* ---------- helpers país/CC ---------- */
@@ -114,6 +140,24 @@ function dedupeDisplayPhones(arr=[]) {
 /* ---------- cache última export ---------- */
 async function cacheLastExport(rows){ try { await chrome.storage.local.set({ [LAST_EXPORT_KEY]: rows }); } catch {} }
 async function getLastExport(){ try { const o = await chrome.storage.local.get(LAST_EXPORT_KEY); return o[LAST_EXPORT_KEY] || []; } catch { return []; } }
+async function getRemoteScanTask(){
+  try {
+    const stored = await chrome.storage.local.get({ [REMOTE_SCAN_TASK_KEY]: null });
+    return stored[REMOTE_SCAN_TASK_KEY] || null;
+  } catch {
+    return null;
+  }
+}
+async function saveRemoteScanTask(task){
+  try {
+    await chrome.storage.local.set({
+      [REMOTE_SCAN_TASK_KEY]: {
+        ...task,
+        updatedAt: Date.now()
+      }
+    });
+  } catch {}
+}
 
 /* ---------- origin/marketplace ---------- */
 function isMarketplace(technology="", url=""){
@@ -134,7 +178,42 @@ function loadStore(){
   if (raw) { try { return JSON.parse(raw) || {}; } catch { return {}; } }
   return migrateLegacyArray();
 }
-function saveStore(store){ localStorage.setItem(STORE_KEY, JSON.stringify(store)); }
+function saveStore(store){
+  localStorage.setItem(STORE_KEY, JSON.stringify(store));
+  try {
+    chrome.storage.local.set({
+      [STORE_BACKUP_KEY]: store,
+      [STORAGE_VERSION_KEY]: STORAGE_VERSION
+    }).catch(() => {});
+  } catch {}
+}
+async function hydratePersistentStore(){
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) || {};
+        await chrome.storage.local.set({
+          [STORE_BACKUP_KEY]: parsed,
+          [STORAGE_VERSION_KEY]: STORAGE_VERSION
+        });
+        return parsed;
+      } catch {}
+    }
+
+    const stored = await chrome.storage.local.get({
+      [STORE_BACKUP_KEY]: null,
+      [STORAGE_VERSION_KEY]: 0
+    });
+    const backup = stored[STORE_BACKUP_KEY];
+    if (backup && typeof backup === "object") {
+      localStorage.setItem(STORE_KEY, JSON.stringify(backup));
+      return backup;
+    }
+  } catch {}
+
+  return loadStore();
+}
 async function getActiveTabUrl(){
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -142,6 +221,24 @@ async function getActiveTabUrl(){
   } catch {
     return "";
   }
+}
+async function getActiveTabId(){
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tab?.id || null;
+  } catch {
+    return null;
+  }
+}
+async function syncActionIcon(state){
+  try {
+    const tabId = await getActiveTabId();
+    if (!tabId) return;
+    chrome.runtime.sendMessage(
+      { action: `icon:${state}`, tabId },
+      () => { void chrome.runtime?.lastError; }
+    );
+  } catch {}
 }
 function getStoredRecordByUrl(url){
   if (!url) return null;
@@ -343,7 +440,7 @@ function rowsFromStore(store){
 
   const rows = [HEADERS];
 
-  const keys = Object.keys(store).sort();
+  const keys = Object.keys(store);
   const allCountries = Array.from(new Set(
     keys.flatMap((k) => {
       const rec = store[k] || {};
@@ -464,7 +561,7 @@ function rowsFromStore(store){
 
 function rowsFromStorePro(store){
   const rows = [];
-  const keys = Object.keys(store).sort();
+  const keys = Object.keys(store);
   const allCountries = Array.from(new Set(
     keys.flatMap((k) => {
       const rec = store[k] || {};
@@ -593,6 +690,147 @@ function resetGrid(root, refs){
   refs.bottomR = g.querySelector("#pair-bottom-right");
 }
 
+let _extractLoadingStyles = false;
+function ensureExtractLoadingStyles() {
+  if (_extractLoadingStyles) return;
+  _extractLoadingStyles = true;
+  const style = document.createElement("style");
+  style.id = "extract-loading-styles";
+  style.textContent = `
+    .extract-loading-card{
+      min-height: 100%;
+      border:1px solid var(--ui-border);
+      border-radius:16px;
+      background:var(--ui-surface);
+      padding:16px;
+      display:flex;
+      flex-direction:column;
+      justify-content:center;
+      gap:8px;
+      box-sizing:border-box;
+    }
+    .extract-loading-label{
+      font-size:11px;
+      line-height:1.2;
+      font-weight:700;
+      letter-spacing:.02em;
+      color:#8a94a6;
+    }
+    .extract-loading-title{
+      font-size:17px;
+      line-height:1.18;
+      font-weight:800;
+      color:#18233f;
+    }
+    .extract-loading-copy{
+      font-size:12px;
+      line-height:1.45;
+      font-weight:600;
+      color:#60708f;
+    }
+    .extract-loading-step{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      width:max-content;
+      padding:8px 12px;
+      border-radius:999px;
+      background:rgba(39,205,242,.12);
+      color:#0f5e7a;
+      font-size:12px;
+      line-height:1;
+      font-weight:800;
+    }
+    .extract-loading-dot{
+      width:10px;
+      height:10px;
+      border-radius:999px;
+      background:#27cdf2;
+      box-shadow:0 0 0 0 rgba(39,205,242,.45);
+      animation:extract-loading-pulse 1.25s ease-in-out infinite;
+    }
+    @keyframes extract-loading-pulse{
+      0%{ transform:scale(.88); box-shadow:0 0 0 0 rgba(39,205,242,.45); }
+      70%{ transform:scale(1); box-shadow:0 0 0 8px rgba(39,205,242,0); }
+      100%{ transform:scale(.88); box-shadow:0 0 0 0 rgba(39,205,242,0); }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function renderExtractionLoadingState(refs, { marketplaceName = "", isMarketplace = false, deepScan = false, amazonBasicMode = false } = {}) {
+  ensureExtractLoadingStyles();
+  const isAmazon = String(marketplaceName || "").toLowerCase() === "amazon";
+  const steps = isMarketplace
+    ? (isAmazon
+        ? (amazonBasicMode
+            ? [
+                "Paso 1 de 2 · Revisando la página visible de Amazon",
+                "Paso 2 de 2 · Leyendo correos, teléfonos y dirección visibles"
+              ]
+            : [
+                "Paso 1 de 3 · Abriendo el bloque de seguridad de Amazon",
+                "Paso 2 de 3 · Amazon está cargando la información de seguridad",
+                "Paso 3 de 3 · Releyendo correos, teléfonos y dirección"
+              ])
+        : [
+            "Paso 1 de 3 · Abriendo detalles del marketplace",
+            "Paso 2 de 3 · Buscando correos y teléfonos",
+            "Paso 3 de 3 · Releyendo el contenido cargado"
+          ])
+    : [
+        deepScan
+          ? "Paso 1 de 2 · Leyendo la página principal"
+          : "Paso 1 de 2 · Leyendo la página",
+        deepScan
+          ? "Paso 2 de 2 · Explorando los datos detectados"
+          : "Paso 2 de 2 · Ordenando los resultados"
+      ];
+
+  const renderCard = (mount, label, title, copy) => {
+    if (!mount) return;
+    mount.innerHTML = `
+      <section class="extract-loading-card">
+        <div class="extract-loading-label">${label}</div>
+        <div class="extract-loading-title">${title}</div>
+        <div class="extract-loading-copy">${copy}</div>
+      </section>
+    `;
+  };
+
+  renderCard(refs.topL, "Nombre encontrado", isMarketplace ? "Extrayendo el título del producto..." : "Extrayendo el nombre de la web...", isAmazon ? "Estamos leyendo el nombre real del producto antes de mostrar los datos visibles." : (isMarketplace ? "Estamos leyendo el título real del producto y preparando los datos visibles." : "Estamos leyendo el nombre principal y los datos visibles de esta página."));
+  renderCard(refs.topR, "Tecnología detectada", marketplaceName || "Analizando web", isAmazon ? (amazonBasicMode ? "Amazon se revisa en modo básico al haber agotado los 20 análisis completos gratis." : "Amazon carga parte de los datos al abrir la sección de seguridad. Espera un momento.") : (isMarketplace ? "Marketplace detectado. Espera mientras abrimos sus secciones dinámicas." : "Estamos detectando la tecnología y reuniendo los datos principales."));
+  renderCard(refs.midL, "Teléfonos", "Buscando teléfonos...", amazonBasicMode ? "Se revisa solo la página visible para encontrar teléfonos sin abrir bloques internos." : "Se revisa la página visible y, si hace falta, el contenido expandido.");
+  renderCard(refs.midR, "Correos", "Buscando correos...", "Cuando termine la lectura, aquí aparecerán los correos encontrados.");
+  renderCard(refs.bottomL, "Estado de extracción", steps[0], isMarketplace ? "Este marketplace carga parte del contenido al hacer clic. La extracción puede tardar un poco más." : "La extracción está en curso. Enseguida verás los resultados completos.");
+  renderCard(refs.bottomR, "Progreso", "", "");
+
+  const stepHost = refs.bottomR?.querySelector(".extract-loading-title");
+  const copyHost = refs.bottomR?.querySelector(".extract-loading-copy");
+  const labelHost = refs.bottomR?.querySelector(".extract-loading-label");
+  if (labelHost) labelHost.textContent = "Espera un momento";
+  if (stepHost) stepHost.innerHTML = `<span class="extract-loading-step"><span class="extract-loading-dot"></span>${steps[0]}</span>`;
+  if (copyHost) {
+    copyHost.textContent = isMarketplace
+      ? (isAmazon
+          ? (amazonBasicMode
+              ? "Amazon está revisando solo la página visible. Pasa a Premium para mantener la extracción profunda."
+              : "Amazon está cargando la información de seguridad antes de mostrarte correos, teléfonos y dirección.")
+          : "Estamos abriendo y leyendo bloques dinámicos antes de mostrarte correos, teléfonos y enlaces.")
+      : "Estamos reuniendo la información para mostrarla ordenada en la extensión.";
+  }
+
+  let index = 0;
+  const timer = window.setInterval(() => {
+    index = (index + 1) % steps.length;
+    if (stepHost) stepHost.innerHTML = `<span class="extract-loading-step"><span class="extract-loading-dot"></span>${steps[index]}</span>`;
+  }, 950);
+
+  return () => {
+    window.clearInterval(timer);
+  };
+}
+
 /* =================== BOOTSTRAP =================== */
 document.addEventListener("DOMContentLoaded", async () => {
   function setupScrollJump() {
@@ -603,11 +841,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     const refresh = () => {
       const atTop = root.scrollTop <= 24;
       const nearBottom = (root.scrollTop + root.clientHeight) >= (root.scrollHeight - 24);
-      btn.textContent = nearBottom ? "⌃" : "⌄";
-      btn.setAttribute("aria-label", nearBottom ? "Volver arriba" : "Ir abajo");
-      btn.title = nearBottom ? "Volver arriba" : "Ir abajo";
-      btn.classList.toggle("is-top", atTop && !nearBottom);
-      btn.classList.toggle("is-bottom", nearBottom);
+      const showBackToTop = !atTop && nearBottom;
+      btn.textContent = showBackToTop ? "Volver arriba" : "Ver resultados";
+      btn.setAttribute("aria-label", showBackToTop ? "Volver arriba" : "Ver resultados");
+      btn.title = showBackToTop ? "Volver arriba" : "Ver resultados";
+      btn.classList.toggle("is-top", atTop);
+      btn.classList.toggle("is-bottom", showBackToTop);
       if (!atTop && !nearBottom) {
         btn.classList.remove("is-top");
         btn.classList.remove("is-bottom");
@@ -615,9 +854,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     };
 
     btn.addEventListener("click", () => {
+      const atTop = root.scrollTop <= 24;
       const nearBottom = (root.scrollTop + root.clientHeight) >= (root.scrollHeight - 24);
+      const showBackToTop = !atTop && nearBottom;
       root.scrollTo({
-        top: nearBottom ? 0 : root.scrollHeight,
+        top: showBackToTop ? 0 : root.scrollHeight,
         behavior: "smooth"
       });
     });
@@ -625,6 +866,32 @@ document.addEventListener("DOMContentLoaded", async () => {
     root.addEventListener("scroll", refresh, { passive: true });
     window.addEventListener("resize", refresh, { passive: true });
     refresh();
+  }
+
+  async function openRemoteScanPage() {
+    await chrome.tabs.create({ url: chrome.runtime.getURL("remote-scan.html"), active: true });
+  }
+
+  async function updatePromoCards(access = {}) {
+    const premiumCard = document.getElementById("promo-premium-card");
+    const premiumCta = document.getElementById("promo-premium-cta");
+    const premiumMicrocopy = document.getElementById("promo-premium-microcopy");
+    const urlsCounter = document.getElementById("promo-urls-counter");
+    if (!premiumCard || !premiumCta || !premiumMicrocopy || !urlsCounter) return;
+
+    const task = await getRemoteScanTask();
+    const processed = Math.max(0, Number(task?.currentIndex || 0));
+    urlsCounter.textContent = `URLs escaneadas: ${Math.min(processed, 1000)} / 1000`;
+
+    if (access?.isPremium) {
+      premiumCard.dataset.locked = "false";
+      premiumMicrocopy.textContent = "Modo masivo activado · Listo para escanear hasta 1000 URLs";
+      premiumCta.textContent = "Abrir extractor masivo";
+    } else {
+      premiumCard.dataset.locked = "false";
+      premiumMicrocopy.textContent = "Prueba 1 lote gratis al día de hasta 5 URLs";
+      premiumCta.textContent = "Probar extractor masivo";
+    }
   }
 
   function setupPopupTabs() {
@@ -638,7 +905,13 @@ document.addEventListener("DOMContentLoaded", async () => {
         section.hidden = !active;
       });
     };
-    buttons.forEach((btn) => btn.addEventListener("click", () => activate(btn.dataset.tabTarget)));
+    buttons.forEach((btn) => btn.addEventListener("click", () => {
+      if (btn.dataset.tabTarget === "remote-scan-tab") {
+        openRemoteScanPage();
+        return;
+      }
+      activate(btn.dataset.tabTarget);
+    }));
     activate("extractor");
     return activate;
   }
@@ -792,6 +1065,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (typeof XLSX === "undefined")  await loadScriptOnce("libs/xlsx.full.min.js", "XLSX");
   }
   ensureLibs().catch(()=>{});
+  await hydratePersistentStore();
 
   const [{ country }, { cache: cachedLicense }] = await Promise.all([
     chrome.storage.local.get("country"),
@@ -802,11 +1076,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (cachedLicense?.plan === "premium" || cachedLicense?.plan === "free") {
     await setUserPlan(cachedLicense.plan).catch(() => {});
   }
-  let accessState = await getAccessState();
+  let accessState = await getAccessState({ remote: false });
   let lastQueryLabel = "";
   let handleExcelExport = async () => {};
   let handleCsvExport = async () => {};
   let handleJsonExport = async () => {};
+  let premiumEmail = await getPremiumEmail();
+  let premiumEmailFeedback = { type: "", message: "" };
   let deepScanUiState = { enabled: false, marketName: null };
 
   function currentHeaderStats() {
@@ -832,7 +1108,9 @@ document.addEventListener("DOMContentLoaded", async () => {
           if (next) {
             const ok = await showInfoModal({
               title: "Exploración profunda",
-              message: "Activa la extracción profunda solo en tiendas. Recorre enlaces clave del dominio y puede tardar unos segundos más.",
+              message: accessState.isPremium
+                ? "Activa la búsqueda avanzada para recorrer enlaces clave del dominio y encontrar más correos, teléfonos y enlaces."
+                : "Tienes 1 uso gratis cada 24 horas. Al activarla, la búsqueda avanzada recorre enlaces clave del dominio para encontrar más correos, teléfonos y enlaces.",
               okText: "Entendido"
             });
             if (!ok) return;
@@ -845,6 +1123,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       },
       onUpgrade: ({ source }) => openStripeCheckout({ source, plan: "month" }),
       onRefresh: () => extractAndRender({ deepScan: !!deepScanUiState.enabled, forceRefresh: true }),
+      onOpenRemoteScan: () => openRemoteScanPage(),
       onCountryChange: onCountryChanged,
       onExcel: handleExcelExport,
       onCSV: handleCsvExport,
@@ -866,17 +1145,71 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function refreshPlanUi() {
     renderHeaderUi();
+    updatePromoCards(accessState).catch(() => {});
     const lastDeepScanLabel = accessState.lastDeepScanLabel || "";
     const marketName = deepScanUiState.marketName;
     const deepLocked = !accessState.canUseDeepExploration;
+    const deepUsedToday = !accessState.isPremium && (Number(accessState.deepUsed || 0) >= Number(accessState.deepLimit || 1));
     const deepDisabled = deepLocked || !!marketName;
     const deepSubtitle = deepLocked
-      ? "Disponible solo en Premium."
+      ? (deepUsedToday ? "Ya usaste la búsqueda avanzada gratuita de hoy." : "Disponible solo en Premium.")
       : marketName
         ? `Desactivada temporalmente en ${marketName}.`
-        : (deepScanUiState.enabled ? "Activa para esta web y las páginas clave." : "Actívala para revisar páginas clave del mismo dominio.");
+        : (deepScanUiState.enabled
+            ? (accessState.isPremium ? "Activa para esta web y las páginas clave." : "Activa ahora. Este uso gratis cuenta durante 24 horas.")
+            : (accessState.isPremium ? "Actívala para revisar páginas clave del mismo dominio." : "Tienes 1 uso gratis cada 24 horas."));
     renderPlanStatus(planMount, {
       access: { ...accessState, lastDeepScanLabel, lastQueryLabel },
+      premiumEmail,
+      emailFeedback: premiumEmailFeedback,
+      onEmailEditStart: () => {
+        premiumEmailFeedback = { type: "", message: "" };
+      },
+      onVerifyEmail: async (email) => {
+        const normalized = await setPremiumEmail(email);
+        premiumEmail = normalized;
+        let synced = await syncLicenseStatus({ force: true, maxAgeMs: 0 });
+        if (
+          synced?.ok
+          && !synced?.premium
+          && synced?.takeoverAvailable
+          && (synced?.source === "manual_email_in_use" || synced?.source === "premium_email_in_use")
+        ) {
+          const wantsTakeover = await showInfoModal({
+            title: "Correo ya activo en otra instalación",
+            message: "Para continuar aquí, debes salir de las otras instalaciones y mover el acceso Premium a esta extensión. ¿Deseas continuar aquí?",
+            okText: "Continuar aquí"
+          });
+          if (wantsTakeover) {
+            synced = await syncLicenseStatus({ force: true, maxAgeMs: 0, takeover: true });
+          }
+        }
+        if (synced?.ok) {
+          const isPremium = synced.plan === "premium";
+          const feedbackMessage = synced?.message || (isPremium ? "Correo verificado. Premium activo." : "Este correo todavía no tiene Premium activo.");
+          premiumEmailFeedback = {
+            type: isPremium ? "success" : "error",
+            message: feedbackMessage
+          };
+          await syncAccessState();
+          return {
+            ok: true,
+            premium: isPremium,
+            message: feedbackMessage
+          };
+        } else {
+          premiumEmailFeedback = {
+            type: "error",
+            message: synced?.message || "No se pudo verificar el correo."
+          };
+          refreshPlanUi();
+          return {
+            ok: false,
+            premium: false,
+            message: synced?.message || "No se pudo verificar el correo."
+          };
+        }
+      },
       onUpgrade: ({ source }) => openStripeCheckout({ source, plan: "month" }),
       deepScan: {
         enabled: !!deepScanUiState.enabled && !marketName,
@@ -885,7 +1218,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         subtitle: deepSubtitle,
         onToggle: async () => {
           if (deepLocked) {
-            await openPremiumUpsell({ source: "deep-scan-toggle", reason: "premium" });
+            await openPremiumUpsell({ source: "deep-scan-toggle", reason: deepUsedToday ? "deep-limit" : "premium" });
             return;
           }
           if (marketName) return;
@@ -893,7 +1226,9 @@ document.addEventListener("DOMContentLoaded", async () => {
           if (next) {
             const ok = await showInfoModal({
               title: "Exploración profunda",
-              message: "Activa la extracción profunda solo en tiendas. Recorre enlaces clave del dominio y puede tardar unos segundos más.",
+              message: accessState.isPremium
+                ? "Activa la búsqueda avanzada para recorrer enlaces clave del dominio y encontrar más correos, teléfonos y enlaces."
+                : "Tienes 1 uso gratis cada 24 horas. Al activarla, la búsqueda avanzada recorre enlaces clave del dominio para encontrar más correos, teléfonos y enlaces.",
               okText: "Entendido"
             });
             if (!ok) return;
@@ -905,7 +1240,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         },
         onRefresh: async () => {
           if (deepLocked) {
-            await openPremiumUpsell({ source: "deep-scan-refresh", reason: "premium" });
+            await openPremiumUpsell({ source: "deep-scan-refresh", reason: deepUsedToday ? "deep-limit" : "premium" });
             return;
           }
           if (marketName) return;
@@ -915,26 +1250,52 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
-  async function syncAccessState() {
-    accessState = await getAccessState();
-    refreshPlanUi();
-    return accessState;
-  }
+  function applyUsageToAccessState(usage) {
+    if (!usage) return;
 
-  async function buildExportPayload(format, rowsCount) {
-    const activeUrl = await getActiveTabUrl();
-    let domain = "";
-    try { domain = activeUrl ? new URL(activeUrl).hostname.replace(/^www\./i, "") : ""; } catch {}
-    return {
-      format,
-      country: CURRENT_ISO,
-      recordsCount: Math.max(0, Number(rowsCount || 0)),
-      domain
+    const plan = usage.plan === "premium" ? "premium" : "free";
+    const isPremium = plan === "premium";
+    const exportsUsed = isPremium ? 0 : Math.max(0, Number(usage.exportsUsed) || 0);
+    const exportsLimit = Number(usage.exportsLimit) || 1;
+
+    accessState = {
+      ...accessState,
+      plan,
+      isPremium,
+      canDownload: isPremium ? true : exportsUsed < exportsLimit,
+      canUseDeepExploration: isPremium ? true : !!accessState.canUseDeepExploration,
+      canUseRemoteScan: isPremium ? true : !!accessState.canUseRemoteScan,
+      planLabel: isPremium ? "Premium" : "Gratis",
+      usageLabel: isPremium ? "Ilimitado" : `${exportsUsed} de ${exportsLimit}`,
+      exportsUsed,
+      exportsLimit,
+      exportsRemaining: isPremium ? null : Math.max(0, exportsLimit - exportsUsed)
     };
   }
 
+  async function preserveCachedViewForCurrentContext() {
+    const activeUrl = await getActiveTabUrl();
+    const cached = getStoredRecordByUrlForCountry(activeUrl, CURRENT_ISO);
+    if (!cached) return false;
+
+    await renderDataToUi(cached.record, cached.url);
+    await syncActionIcon("saved");
+    updateHeaderStats(headerMount, aggregateStatsFromStore(loadStore()));
+    refreshPlanUi();
+    return true;
+  }
+
+  async function syncAccessState() {
+    const previousPlan = accessState?.plan || "";
+    accessState = await getAccessState();
+    refreshPlanUi();
+    if (previousPlan && previousPlan !== accessState.plan) {
+      await preserveCachedViewForCurrentContext();
+    }
+    return accessState;
+  }
+
   async function authorizeExport(format, rowsCount) {
-    const payload = await buildExportPayload(format, rowsCount);
     const allowed = await syncAccessState();
 
     if (!allowed.canDownload) {
@@ -942,19 +1303,47 @@ document.addEventListener("DOMContentLoaded", async () => {
       return null;
     }
 
-    const usage = await registerDownload(payload);
+    return {
+      format,
+      rowsCount,
+      isPremium: !!allowed.isPremium
+    };
+  }
+
+  async function finalizeExportUsage(format) {
+    const usage = await registerDownload();
     if (!usage.allowed) {
       await syncAccessState();
-      if (usage.reason === "downloads_limit") {
-        await openPremiumUpsell({ source: `${format}-export`, reason: "downloads-limit" });
-      } else {
+      if (usage.reason !== "downloads_limit" && usage.reason !== "premium_required") {
         toast(alerts, "error", usage.message || "No se pudo validar la exportación.");
       }
       return null;
     }
 
-    await syncAccessState();
+    applyUsageToAccessState(usage);
+    refreshPlanUi();
+    syncAccessState().catch(() => {});
     return usage;
+  }
+
+  async function clearProgressAfterExport() {
+    saveStore({});
+    try {
+      await chrome.storage.local.set({
+        [DEEP_SCAN_META_KEY]: {}
+      });
+    } catch {}
+
+    accessState = {
+      ...accessState,
+      lastDeepScanLabel: ""
+    };
+    updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
+    resetGrid(root, refs);
+    refs.topL.dataset.sourceUrl = "";
+    refs.topL.dataset.marketplace = "false";
+    lastQueryLabel = "";
+    refreshPlanUi();
   }
 
   let syncAfterCheckoutBusy = false;
@@ -997,17 +1386,24 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     const state = await syncAccessState();
-    if (!state.canUseDeepExploration) {
-      await openPremiumUpsell({ source: "remote-scan", reason: "premium" });
-      return;
-    }
 
+    let allTargets = [];
     let targets = [];
     try {
-      targets = parseBatchUrls(value, MAX_REMOTE_BATCH_URLS);
+      allTargets = parseBatchUrls(value, 1000);
     } catch (e) {
       toast(alerts, "error", e?.message || "Revisa las URLs pegadas.");
       return;
+    }
+
+    const amazonCount = allTargets.filter((url) => isAmazonTargetUrl(url)).length;
+    const amazonOnly = amazonCount > 0 && amazonCount === allTargets.length;
+    const amazonUsage = (!state.isPremium && amazonCount > 0) ? await getAmazonUsageState() : null;
+
+    if (!state.isPremium && amazonOnly) {
+      targets = allTargets;
+    } else {
+      targets = parseBatchUrls(value, state.remoteUrlLimit || 5);
     }
 
     if (!targets.length) {
@@ -1015,28 +1411,96 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
+    const previousTask = await getRemoteScanTask();
+    const sameTargets = Array.isArray(previousTask?.targets)
+      && previousTask.targets.length === targets.length
+      && previousTask.targets.every((item, index) => item === targets[index]);
+    const canResume = sameTargets
+      && !["done", "cancelled"].includes(previousTask?.status)
+      && Number(previousTask?.currentIndex || 0) < targets.length;
+
+    if (!canResume && !state.isPremium && amazonCount > 0 && amazonUsage && amazonCount > (amazonUsage.amazonRemaining || 0)) {
+      await openPremiumUpsell({ source: "remote-scan", reason: "amazon-limit" });
+      return;
+    }
+
+    if (!canResume && !amazonOnly && !state.canUseRemoteScan) {
+      await openPremiumUpsell({ source: "remote-scan", reason: "remote-scan-limit" });
+      return;
+    }
+
+    if (!canResume && !state.isPremium && !amazonOnly && allTargets.length > (state.remoteUrlLimit || 5)) {
+      await openPremiumUpsell({ source: "remote-scan", reason: "remote-scan-urls-limit" });
+      return;
+    }
+
+    if (!canResume) {
+      if (!state.isPremium && !amazonOnly) {
+        const remoteUsage = await registerRemoteScanUse();
+        if (!remoteUsage.allowed) {
+          await syncAccessState();
+          await openPremiumUpsell({ source: "remote-scan", reason: "remote-scan-limit" });
+          return;
+        }
+        if (remoteUsage.registered) {
+          await syncAccessState();
+        }
+      }
+    }
+
+    const startIndex = canResume ? Number(previousTask.currentIndex || 0) : 0;
+    const batchItems = canResume && Array.isArray(previousTask.batchItems) ? [...previousTask.batchItems] : [];
+    let totalVisited = canResume ? Number(previousTask.totalVisited || 0) : 0;
+    let lastResult = null;
+    let task = {
+      id: previousTask?.id && sameTargets ? previousTask.id : crypto.randomUUID(),
+      rawInput: value,
+      targets,
+      country: CURRENT_ISO,
+      status: "running",
+      currentIndex: startIndex,
+      totalVisited,
+      batchItems,
+      progressText: startIndex
+        ? `Continuando lote: ${startIndex}/${targets.length} URL(s) ya procesadas.`
+        : `Preparando lote de ${targets.length} URL(s)...`,
+      summaryCopy: batchItems.length ? `Resultados parciales: ${batchItems.length}/${targets.length} URL(s).` : ""
+    };
+    await saveRemoteScanTask(task);
+
     const previous = ui.button?.textContent || "Escanear lote";
     if (ui.button) {
       ui.button.disabled = true;
-      ui.button.textContent = "Escaneando...";
+      ui.button.textContent = startIndex ? "Continuando..." : "Escaneando...";
     }
     ui.setProgress?.({
       visible: true,
-      text: `Preparando lote de ${targets.length} URL(s)...`,
-      percent: 0
+      text: task.progressText,
+      percent: targets.length ? (startIndex / targets.length) * 100 : 0
     });
+    if (batchItems.length) {
+      ui.setSummary?.({
+        visible: true,
+        copy: task.summaryCopy,
+        items: batchItems
+      });
+    }
 
     try {
-      toast(alerts, "info", `Escaneando lote premium de ${targets.length} URL(s)...`, 1200);
-      let totalVisited = 0;
-      let lastResult = null;
-      const batchItems = [];
+      toast(alerts, "info", startIndex ? `Continuando lote premium desde ${startIndex + 1}/${targets.length}.` : `Escaneando lote premium de ${targets.length} URL(s)...`, 1200);
 
-      for (let i = 0; i < targets.length; i++) {
+      for (let i = startIndex; i < targets.length; i++) {
         const targetUrl = targets[i];
+        task = {
+          ...task,
+          status: "running",
+          currentIndex: i,
+          progressText: `URL ${i + 1}/${targets.length}: ${targetUrl}`
+        };
+        await saveRemoteScanTask(task);
         ui.setProgress?.({
           visible: true,
-          text: `URL ${i + 1}/${targets.length}: ${targetUrl}`,
+          text: task.progressText,
           percent: (i / targets.length) * 100
         });
 
@@ -1044,9 +1508,15 @@ document.addEventListener("DOMContentLoaded", async () => {
           const { data, url } = await scanUrlWithExtractor(targetUrl, {
             country: CURRENT_ISO,
             onProgress: ({ index, total, url: progressUrl }) => {
+              const progressText = `URL ${i + 1}/${targets.length} · página ${index}/${total}: ${progressUrl}`;
+              saveRemoteScanTask({
+                ...task,
+                currentIndex: i,
+                progressText
+              });
               ui.setProgress?.({
                 visible: true,
-                text: `URL ${i + 1}/${targets.length} · página ${index}/${total}: ${progressUrl}`,
+                text: progressText,
                 percent: ((i + (index / total)) / targets.length) * 100
               });
             }
@@ -1062,14 +1532,17 @@ document.addEventListener("DOMContentLoaded", async () => {
             updateHeaderStats(headerMount, aggregateStatsFromStore(store));
           } catch (e) { console.error("[Store] remote merge/save:", e); }
 
-          await markDeepScanMeta(url, {
-            country: CURRENT_ISO,
-            deepScan: true,
-            visitedCount: Array.isArray(data?.visitedUrls) ? data.visitedUrls.length : 1
-          });
+        await markDeepScanMeta(url, {
+          country: CURRENT_ISO,
+          deepScan: true,
+          visitedCount: Array.isArray(data?.visitedUrls) ? data.visitedUrls.length : 1
+        });
+        if (!state.isPremium && isAmazonTargetUrl(url)) {
+          await registerAmazonUse(1);
+        }
 
-          totalVisited += Array.isArray(data?.visitedUrls) ? data.visitedUrls.length : 1;
-          lastResult = { record: finalRecord, url };
+        totalVisited += Array.isArray(data?.visitedUrls) ? data.visitedUrls.length : 1;
+        lastResult = { record: finalRecord, url };
           batchItems.push({
             status: "OK",
             url,
@@ -1093,6 +1566,22 @@ document.addEventListener("DOMContentLoaded", async () => {
             detail: error?.message || "No se pudo procesar."
           });
         }
+
+        task = {
+          ...task,
+          status: "running",
+          currentIndex: i + 1,
+          totalVisited,
+          batchItems,
+          progressText: `Progreso guardado: ${i + 1}/${targets.length} URL(s).`,
+          summaryCopy: `Resultados parciales: ${batchItems.length}/${targets.length} URL(s).`
+        };
+        await saveRemoteScanTask(task);
+        ui.setSummary?.({
+          visible: true,
+          copy: task.summaryCopy,
+          items: batchItems
+        });
       }
 
       if (lastResult) {
@@ -1118,6 +1607,15 @@ document.addEventListener("DOMContentLoaded", async () => {
         visible: true,
         copy: `Se procesaron ${targets.length} URL(s). Cada resultado correcto ya quedó agregado a los datos exportables de Excel/CSV y también al acumulado de Scraping.`,
         items: batchItems
+      });
+      await saveRemoteScanTask({
+        ...task,
+        status: "done",
+        currentIndex: targets.length,
+        totalVisited,
+        batchItems,
+        progressText: `Lote completado: ${targets.length} URL(s) procesadas.`,
+        summaryCopy: `Se procesaron ${targets.length} URL(s). Puedes descargar los resultados desde la extensión.`
       });
       toast(alerts, "success", `Lote premium completado: ${targets.length} URL(s).`);
     } catch (e) {
@@ -1167,6 +1665,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     } catch (e) { console.error("[UI] actions:", e); }
 
     refreshPlanUi();
+    if (footerNote) {
+      toast(alerts, "info", footerNote, 1400);
+    }
 
     return normalized;
   }
@@ -1209,22 +1710,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!rows.length) {
         const last = await getLastExport();
         if (!last.length) { toast(alerts, "info", "No hay datos para exportar."); return; }
-        const usage = await authorizeExport("excel", last.length);
-        if (!usage) return;
+        const allowed = await authorizeExport("excel", last.length);
+        if (!allowed) return;
         exportToExcel(last, "datos.xlsx");
+        await finalizeExportUsage("excel");
         toast(alerts, "success", "Descargando la última exportación.");
         return;
       }
-      const usage = await authorizeExport("excel", rows.length);
-      if (!usage) return;
+      const allowed = await authorizeExport("excel", rows.length);
+      if (!allowed) return;
       exportToExcel(rows, "datos.xlsx");
+      await finalizeExportUsage("excel");
       await cacheLastExport(rows);
-
-      saveStore({});
-      updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
-      resetGrid(root, refs);
-      lastQueryLabel = "";
-      renderHeaderUi();
+      await clearProgressAfterExport();
+      refreshPlanUi();
       toast(alerts, "success", "Exportado. El progreso guardado se limpió.");
     } catch (e) { console.error("[Export Excel]", e); }
   };
@@ -1237,22 +1736,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!rows.length) {
         const last = await getLastExport();
         if (!last.length) { toast(alerts, "info", "No hay datos para exportar."); return; }
-        const usage = await authorizeExport("csv", last.length);
-        if (!usage) return;
+        const allowed = await authorizeExport("csv", last.length);
+        if (!allowed) return;
         exportToCSV(last, "datos.csv");
+        await finalizeExportUsage("csv");
         toast(alerts, "success", "Descargando la última exportación.");
         return;
       }
-      const usage = await authorizeExport("csv", rows.length);
-      if (!usage) return;
+      const allowed = await authorizeExport("csv", rows.length);
+      if (!allowed) return;
       exportToCSV(rows, "datos.csv");
+      await finalizeExportUsage("csv");
       await cacheLastExport(rows);
-
-      saveStore({});
-      updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
-      resetGrid(root, refs);
-      lastQueryLabel = "";
-      renderHeaderUi();
+      await clearProgressAfterExport();
+      refreshPlanUi();
       toast(alerts, "success", "Exportado. El progreso guardado se limpió.");
     } catch (e) { console.error("[Export CSV]", e); }
   };
@@ -1263,22 +1760,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!rows.length) {
         const last = await getLastExport();
         if (!last.length) { toast(alerts, "info", "No hay datos para exportar."); return; }
-        const usage = await authorizeExport("json", last.length);
-        if (!usage) return;
+        const allowed = await authorizeExport("json", last.length);
+        if (!allowed) return;
         exportToJSON(last, "datos.json");
+        await finalizeExportUsage("json");
         toast(alerts, "success", "Descargando la última exportación.");
         return;
       }
-      const usage = await authorizeExport("json", rows.length);
-      if (!usage) return;
+      const allowed = await authorizeExport("json", rows.length);
+      if (!allowed) return;
       exportToJSON(rows, "datos.json");
+      await finalizeExportUsage("json");
       await cacheLastExport(rows);
-
-      saveStore({});
-      updateHeaderStats(headerMount, { registros: 0, emails: 0, phones: 0 });
-      resetGrid(root, refs);
-      lastQueryLabel = "";
-      renderHeaderUi();
+      await clearProgressAfterExport();
+      refreshPlanUi();
       toast(alerts, "success", "Exportado. El progreso guardado se limpió.");
     } catch (e) { console.error("[Export JSON]", e); }
   };
@@ -1287,23 +1782,47 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   try {
     if (typeof renderRemoteScanUi === "function") {
+      const remoteScanTask = await getRemoteScanTask();
+      const hasOpenRemoteTask = !!remoteScanTask
+        && !["done", "cancelled"].includes(remoteScanTask.status)
+        && Number(remoteScanTask.currentIndex || 0) < (remoteScanTask.targets?.length || 0);
       renderRemoteScanUi(remoteScanMount, {
-        locked: !accessState.canUseDeepExploration,
-        onLockedAttempt: () => openPremiumUpsell({ source: "remote-scan", reason: "premium" }),
+        locked: !(accessState.canUseRemoteScan || hasOpenRemoteTask),
+        access: accessState,
+        task: remoteScanTask,
+        onLockedAttempt: () => openPremiumUpsell({ source: "remote-scan", reason: accessState.canUseRemoteScan ? "premium" : "remote-scan-limit" }),
         onSubmit: (value, ui) => scanProvidedUrl(value, ui),
-        onViewScraping: () => activateTab("extractor")
+        onViewScraping: () => activateTab("extractor"),
+        onDraftChange: async (value) => {
+          const current = await getRemoteScanTask();
+          if (current && !["done", "cancelled"].includes(current.status)) return;
+          await saveRemoteScanTask({
+            id: current?.id || crypto.randomUUID(),
+            rawInput: value,
+            targets: [],
+            country: CURRENT_ISO,
+            status: "draft",
+            currentIndex: 0,
+            totalVisited: 0,
+            batchItems: [],
+            progressText: "",
+            summaryCopy: ""
+          });
+        }
       });
     }
   } catch (e) { console.error("No se pudo cargar el escaneo por URL:", e); }
 
   // Render principal (usa columnas)
   async function extractAndRender({ deepScan, forceRefresh = false } = {}){
+    let stopLoadingState = null;
     try{
       if (!runExtractionOnActiveTab) throw new Error("Servicio de extracción no disponible.");
-      const { deepScanEnabled } = await chrome.storage.local.get({ deepScanEnabled: true });
+      const { deepScanEnabled } = await chrome.storage.local.get({ deepScanEnabled: false });
       const state = await syncAccessState();
       const requestedDeep = (typeof deepScan === "boolean") ? deepScan : deepScanEnabled;
       const activeUrl = await getActiveTabUrl();
+      const isAmazonCurrentUrl = isAmazonTargetUrl(activeUrl || "");
       const cached = getStoredRecordByUrlForCountry(activeUrl, CURRENT_ISO);
       const deepScanState = activeUrl
         ? await wasUrlAlreadyDeepScanned(activeUrl, CURRENT_ISO)
@@ -1314,30 +1833,58 @@ document.addEventListener("DOMContentLoaded", async () => {
       };
       refreshPlanUi();
       const alreadyDeepScanned = !!deepScanState.cached;
-      const useDeep = requestedDeep && state.canUseDeepExploration && !(alreadyDeepScanned && !forceRefresh);
+      let useDeep = requestedDeep && state.canUseDeepExploration && !(alreadyDeepScanned && !forceRefresh);
+      const amazonUsage = (isAmazonCurrentUrl && !state.isPremium)
+        ? await getAmazonUsageState()
+        : null;
+      const amazonFullMode = state.isPremium || !isAmazonCurrentUrl || !!amazonUsage?.allowed;
 
       if (cached && !forceRefresh) {
         await renderDataToUi(
           cached.record,
-          cached.url,
-          alreadyDeepScanned
-            ? "Mostrando los ultimos datos guardados. La exploracion profunda no se repitio porque ya existe un deep scan reciente para esta URL y esta bandera."
-            : undefined
+          cached.url
         );
+        await syncActionIcon("saved");
         updateHeaderStats(headerMount, aggregateStatsFromStore(loadStore()));
-        renderHeaderUi();
-        if (alreadyDeepScanned && requestedDeep) {
-          return;
+        refreshPlanUi();
+        return;
+      }
+
+      if (useDeep && !state.isPremium) {
+        const deepUsage = await registerDeepScanUse();
+        if (!deepUsage.allowed) {
+          await syncAccessState();
+          deepScanUiState.enabled = false;
+          await chrome.storage.local.set({ deepScanEnabled: false });
+          refreshPlanUi();
+          await openPremiumUpsell({ source: "deep-scan-run", reason: "deep-limit" });
+          useDeep = false;
+        } else {
+          await syncAccessState();
         }
       }
 
       refs.topL.innerHTML = ""; refs.topR.innerHTML = "";
       refs.midL.innerHTML = ""; refs.midR.innerHTML = "";
       refs.bottomL.innerHTML = ""; refs.bottomR.innerHTML = "";
+      stopLoadingState = renderExtractionLoadingState(refs, {
+        marketplaceName: detectMarketplaceFromURL(activeUrl || "") || "",
+        isMarketplace: !!detectMarketplaceFromURL(activeUrl || ""),
+        deepScan: !!useDeep,
+        amazonBasicMode: isAmazonCurrentUrl && !amazonFullMode
+      });
       toast(alerts, "info", useDeep ? "Procesando datos..." : "Actualizando datos...", 900);
+      await syncActionIcon("loading");
 
       // ⬇️ pasamos SIEMPRE la bandera actual al content
-      const { data, url } = await runExtractionOnActiveTab({ deepScan: useDeep, country: CURRENT_ISO });
+      const { data, url } = await runExtractionOnActiveTab({
+        deepScan: useDeep,
+        country: CURRENT_ISO,
+        amazonFullMode
+      });
+      if (isAmazonCurrentUrl && !state.isPremium && amazonFullMode) {
+        await registerAmazonUse(1);
+      }
 
       // Guardar + stats (persistimos lo que muestra la UI; no reformateamos)
       let finalRecord = data;
@@ -1355,6 +1902,10 @@ document.addEventListener("DOMContentLoaded", async () => {
         deepScan: !!useDeep,
         visitedCount: Array.isArray(data?.visitedUrls) ? data.visitedUrls.length : 0
       });
+      if (useDeep && !state.isPremium) {
+        deepScanUiState.enabled = false;
+        await chrome.storage.local.set({ deepScanEnabled: false });
+      }
       accessState = {
         ...accessState,
         lastDeepScanLabel: buildDeepScanStatusLabel({
@@ -1365,17 +1916,24 @@ document.addEventListener("DOMContentLoaded", async () => {
         })
       };
       refreshPlanUi();
-      await renderDataToUi(finalRecord, url);
+      if (stopLoadingState) { stopLoadingState(); stopLoadingState = null; }
+      const amazonFooterNote = (isAmazonCurrentUrl && !state.isPremium && !amazonFullMode)
+        ? "Has agotado tus 20 análisis completos de Amazon. Seguimos revisando solo la página visible. Pasa a Premium para mantener la extracción profunda."
+        : "";
+      await renderDataToUi(finalRecord, url, amazonFooterNote);
+      await syncActionIcon("saved");
       await syncAccessState();
 
     } catch (e) {
       console.error(e);
+      if (stopLoadingState) { stopLoadingState(); stopLoadingState = null; }
+      await syncActionIcon("error");
       toast(alerts, "error", e?.message || "No se pudo extraer.");
     }
   }
 
   refreshPlanUi();
-  const { deepScanEnabled } = await chrome.storage.local.get({ deepScanEnabled: true });
+  const { deepScanEnabled } = await chrome.storage.local.get({ deepScanEnabled: false });
   await extractAndRender({ deepScan: deepScanEnabled });
 });
 
