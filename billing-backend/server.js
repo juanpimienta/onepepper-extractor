@@ -25,6 +25,8 @@ const ADMIN_PREMIUM_EMAILS = new Set(
 const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2026-02-25.clover" })
   : null;
+const STRIPE_ACTIVE_INSTALL_METADATA_KEY = "onepepper_active_install_id";
+const STRIPE_ACTIVE_INSTALL_EMAIL_KEY = "onepepper_active_install_email";
 
 function normalizeEmail(email = "") {
   return String(email || "").trim().toLowerCase();
@@ -287,6 +289,31 @@ async function findActiveStripeSubscriptionByEmail(email = "") {
   return null;
 }
 
+function getStripeActiveInstallId(customer = {}) {
+  return String(customer?.metadata?.[STRIPE_ACTIVE_INSTALL_METADATA_KEY] || "").trim();
+}
+
+function getStripeActiveInstallEmail(customer = {}) {
+  return normalizeEmail(customer?.metadata?.[STRIPE_ACTIVE_INSTALL_EMAIL_KEY] || "");
+}
+
+async function setStripeActiveInstall(customerId = "", installId = "", email = "") {
+  const customerIdValue = String(customerId || "").trim();
+  const installIdValue = String(installId || "").trim();
+  if (!stripe || !customerIdValue || !installIdValue) return null;
+
+  try {
+    return await stripe.customers.update(customerIdValue, {
+      metadata: {
+        [STRIPE_ACTIVE_INSTALL_METADATA_KEY]: installIdValue,
+        [STRIPE_ACTIVE_INSTALL_EMAIL_KEY]: normalizeEmail(email)
+      }
+    });
+  } catch {
+    return null;
+  }
+}
+
 async function fetchChargeForRefund(refund = {}) {
   if (!stripe) return null;
   const chargeId = typeof refund.charge === "string"
@@ -332,6 +359,9 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       || findLicenseByCustomerId(store, session.customer || "");
     const license = upsertLicense(store, installId || existing?.installId || "");
     applyCheckoutSessionToLicense(license, session);
+    if (license?.customerId && license?.installId) {
+      await setStripeActiveInstall(license.customerId, license.installId, license.userEmail || "");
+    }
     if (license?.subscriptionId) {
       const subscription = await fetchSubscription(license.subscriptionId);
       if (subscription) applySubscriptionToLicense(license, subscription);
@@ -346,6 +376,9 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       || findLicenseByCustomerId(store, subscription.customer || "");
     const license = upsertLicense(store, installId || existing?.installId || "");
     applySubscriptionToLicense(license, subscription);
+    if (license?.premium && license?.customerId && license?.installId) {
+      await setStripeActiveInstall(license.customerId, license.installId, license.userEmail || "");
+    }
   }
 
   if (event.type === "invoice.paid" || event.type === "invoice.payment_failed") {
@@ -364,6 +397,9 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       if (event.type === "invoice.paid" && existing.subscriptionId) {
         const subscription = await fetchSubscription(existing.subscriptionId);
         if (subscription) applySubscriptionToLicense(existing, subscription);
+        if (existing?.premium && existing?.customerId && existing?.installId) {
+          await setStripeActiveInstall(existing.customerId, existing.installId, existing.userEmail || "");
+        }
       }
     }
   }
@@ -571,10 +607,38 @@ app.get("/api/license/status", auth, async (req, res) => {
 
   const activeByStripeEmail = email ? await findActiveStripeSubscriptionByEmail(email) : null;
   if (activeByStripeEmail) {
+    const stripeActiveInstallId = getStripeActiveInstallId(activeByStripeEmail.customer);
+    const stripeActiveInstallEmail = getStripeActiveInstallEmail(activeByStripeEmail.customer);
+    const installMismatch = !!(
+      stripeActiveInstallId
+      && stripeActiveInstallId !== installId
+      && (!stripeActiveInstallEmail || stripeActiveInstallEmail === email)
+    );
+
+    if (installMismatch) {
+      if (takeover) {
+        await setStripeActiveInstall(activeByStripeEmail.customer.id, installId, email);
+      } else {
+        return res.json({
+          premium: false,
+          plan: "free",
+          status: "inactive",
+          provider: "stripe",
+          source: "premium_email_in_use",
+          email,
+          takeoverAvailable: true,
+          message: "Este correo Premium ya está activo en otra instalación."
+        });
+      }
+    } else if (!stripeActiveInstallId || stripeActiveInstallId !== installId) {
+      await setStripeActiveInstall(activeByStripeEmail.customer.id, installId, email);
+    }
+
     const linked = upsertLicense(store, installId);
     linked.userEmail = email;
     linked.customerId = activeByStripeEmail.customer.id;
     applySubscriptionToLicense(linked, activeByStripeEmail.subscription);
+    linked.linkedFromEmail = email;
     await writeStore(store);
     return res.json({
       premium: true,
